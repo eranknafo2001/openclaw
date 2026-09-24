@@ -1,4 +1,4 @@
-import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { createHeartbeatToolResponsePayload } from "../auto-reply/heartbeat-tool-response.js";
 import type { OpenClawConfig } from "../config/config.js";
 import { appendTranscriptMessage } from "../config/sessions/session-accessor.js";
@@ -27,6 +27,14 @@ import {
 } from "./system-events.js";
 
 const collector = vi.hoisted(() => vi.fn());
+const wake = vi.hoisted(() => ({ signal: undefined as AbortSignal | undefined }));
+vi.mock("./heartbeat-wake.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./heartbeat-wake.js")>();
+  return {
+    ...actual,
+    getHeartbeatWakeAbortSignal: () => wake.signal ?? actual.getHeartbeatWakeAbortSignal(),
+  };
+});
 vi.mock("../cron/trigger-script.js", () => ({
   createCronScriptRuntime: () => ({ collectHeartbeatContext: collector }),
 }));
@@ -362,18 +370,31 @@ describe("question-mode heartbeat dispatch", () => {
     });
   });
 
-  it("falls back for provider contract failures without losing the heartbeat", async () => {
-    vi.spyOn(decisions, "evaluateDecision").mockRejectedValue(new DecisionContractError());
+  it.each([
+    ["provider-contract-error", new DecisionContractError()],
+    ["decision-error", new Error("Decision evaluation requires its current Gateway binding.")],
+  ])("falls back on %s without losing the heartbeat", async (reason, error) => {
+    vi.spyOn(decisions, "evaluateDecision").mockRejectedValue(error);
     await withQuestions(async ({ options, reply }) => {
       expect((await runHeartbeatOnce(options)).status).toBe("ran");
       expect(reply).toHaveBeenCalledOnce();
-      expect(String(reply.mock.calls[0]?.[0].Body)).toContain("provider-contract-error");
+      const prompt = String(reply.mock.calls[0]?.[0].Body);
+      expect(prompt).toContain(`group deployment: ${reason}`);
+      expect(prompt).not.toContain("Gateway binding");
     });
   });
 
-  it("does not start fallback work when decision evaluation is cancelled", async () => {
+  it("does not start fallback work when the wake is cancelled during evaluation", async () => {
+    const controller = new AbortController();
     const cancelled = new DOMException("Wake cancelled", "AbortError");
-    vi.spyOn(decisions, "evaluateDecision").mockRejectedValue(cancelled);
+    wake.signal = controller.signal;
+    onTestFinished(() => {
+      wake.signal = undefined;
+    });
+    vi.spyOn(decisions, "evaluateDecision").mockImplementation(async () => {
+      controller.abort(cancelled);
+      throw cancelled;
+    });
     await withQuestions(async ({ options, reply }) => {
       await expect(runHeartbeatOnce(options)).rejects.toBe(cancelled);
       expect(reply).not.toHaveBeenCalled();

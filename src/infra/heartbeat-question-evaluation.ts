@@ -166,15 +166,21 @@ export async function evaluateHeartbeatQuestions(wake: ReadyHeartbeatWake, signa
     if (!preflight.scratchJobId) {
       return run("monitor-unavailable");
     }
-    const collected = await runtime.collectHeartbeatContext({
-      agentId: wake.agentId,
-      monitorJobId: preflight.scratchJobId,
-      sessionKey: conversationKey,
-      commands: group.commands,
-      authority: group.execution,
-      abortSignal: signal,
-      isCurrent,
-    });
+    let collected;
+    try {
+      collected = await runtime.collectHeartbeatContext({
+        agentId: wake.agentId,
+        monitorJobId: preflight.scratchJobId,
+        sessionKey: conversationKey,
+        commands: group.commands,
+        authority: group.execution,
+        abortSignal: signal,
+        isCurrent,
+      });
+    } catch {
+      signal.throwIfAborted();
+      return run(`group ${group.id}: collection-error`);
+    }
     signal.throwIfAborted();
     if (collected.kind !== "collected") {
       return run(`group ${group.id}: ${collected.code}. ${collected.error}`);
@@ -216,11 +222,11 @@ export async function evaluateHeartbeatQuestions(wake: ReadyHeartbeatWake, signa
         signal,
       });
     } catch (error) {
+      // Only wake cancellation suppresses work; any other decision failure keeps the fallback turn.
       signal.throwIfAborted();
-      if (!(error instanceof DecisionContractError)) {
-        throw error;
-      }
-      return run(`group ${group.id}: provider-contract-error`, evidence);
+      const reason =
+        error instanceof DecisionContractError ? "provider-contract-error" : "decision-error";
+      return run(`group ${group.id}: ${reason}`, evidence);
     }
     signal.throwIfAborted();
     if (outcome.status === "unavailable") {

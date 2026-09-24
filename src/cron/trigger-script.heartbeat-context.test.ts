@@ -1,6 +1,13 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
+import "../agents/test-helpers/fast-bash-tools.js";
+import "../agents/test-helpers/fast-coding-tools.js";
+import "../agents/test-helpers/fast-openclaw-tools.js";
+import { createOpenClawCodingTools } from "../agents/agent-tools.js";
+import { resolveScheduledToolPolicyContext } from "../agents/scheduled-tool-policy.js";
 import { jsonResult, type AnyAgentTool } from "../agents/tools/common.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../plugins/runtime.js";
+import { createChannelTestPluginBase, createTestRegistry } from "../test-utils/channel-plugins.js";
 import { createCronScriptRuntime, type HeartbeatContextCollection } from "./trigger-script.js";
 
 const request = (): HeartbeatContextCollection => ({
@@ -87,6 +94,62 @@ describe("heartbeat context collection", () => {
     expect(await collector(execute)(params)).toMatchObject({ kind: "error" });
     expect(execute).not.toHaveBeenCalled();
   });
+
+  it.each([
+    ["still configured", true],
+    ["removed", false],
+  ])(
+    "builds exec from the saved grant only while its creator account is %s",
+    async (_, configured) => {
+      const execute = vi.fn<AnyAgentTool["execute"]>(async () => successful("state"));
+      const config: OpenClawConfig = {
+        channels: { whatsapp: { accounts: configured ? { work: {} } : {} } },
+      };
+      const sessionKey = "agent:main:whatsapp:group:ops";
+      setActivePluginRegistry(
+        createTestRegistry([
+          {
+            pluginId: "whatsapp",
+            source: "test:whatsapp",
+            plugin: createChannelTestPluginBase({
+              id: "whatsapp",
+              config: {
+                listAccountIds: (cfg) => Object.keys(cfg.channels?.whatsapp?.accounts ?? {}),
+              },
+            }),
+          },
+        ]),
+      );
+      onTestFinished(resetPluginRuntimeStateForTest);
+      const params = request();
+      params.authority.scheduledToolPolicy = {
+        version: 1,
+        mode: "account",
+        ownerSessionKey: sessionKey,
+        ownerAccountId: "work",
+      };
+      const result = await createCronScriptRuntime({
+        config,
+        // Real tool construction applies the scheduled-account policy owner; only exec's effect is stubbed.
+        prepareRuntime: async (prepared) => ({
+          createTools: () =>
+            createOpenClawCodingTools({
+              agentId: "main",
+              sessionKey,
+              config,
+              runtimeToolAllowlist: ["exec"],
+              scheduledToolPolicy: resolveScheduledToolPolicyContext({
+                toolsAllow: prepared.toolsAllow,
+                scheduledToolPolicy: prepared.scheduledToolPolicy,
+              }),
+            }).flatMap((tool) => (tool.name === "exec" ? [{ ...tool, execute }] : [])),
+          context: { config, agentId: "main", sessionKey },
+        }),
+      }).collectHeartbeatContext(params);
+      expect(result.kind).toBe(configured ? "collected" : "error");
+      expect(execute).toHaveBeenCalledTimes(configured ? 2 : 0);
+    },
+  );
 
   it("discards results when monitor authority changes while a command runs", async () => {
     let current = true;
