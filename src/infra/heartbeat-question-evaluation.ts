@@ -130,7 +130,12 @@ export async function evaluateHeartbeatQuestions(wake: ReadyHeartbeatWake, signa
   // Readers without a signal (incognito) still settle this check by the deadline.
   const withinDeadline = <T>(read: Promise<T>) =>
     new Promise<T>((resolve, reject) => {
-      const onAbort = () => reject(deadlineSignal.reason);
+      const onAbort = () =>
+        reject(
+          new Error("Heartbeat question check reached its deadline", {
+            cause: deadlineSignal.reason,
+          }),
+        );
       if (deadlineSignal.aborted) {
         onAbort();
         return;
