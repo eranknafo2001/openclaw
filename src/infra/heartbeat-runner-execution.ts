@@ -462,16 +462,22 @@ export async function prepareHeartbeatRunStage(wake: ReadyHeartbeatWake) {
       wake,
       getHeartbeatWakeAbortSignal() ?? new AbortController().signal,
     );
-    // A question edit or new conversation event invalidates even a successful decision.
-    // Reuse the wake owner's retained-work retry instead of settling the old snapshot.
-    if (!decision.isCurrent()) {
-      return skippedHeartbeatStage(HEARTBEAT_SKIP_REQUESTS_IN_FLIGHT, startedAt);
-    }
-    if (decision.kind === "idle") {
-      return skippedHeartbeatStage(decision.reason, startedAt);
-    }
-    if (decision.kind === "run") {
-      questionPrompt = decision.prompt;
+    try {
+      // A question edit or new conversation event invalidates even a successful decision.
+      // Reuse the wake owner's retained-work retry instead of settling the old snapshot.
+      if (!decision.isCurrent()) {
+        return skippedHeartbeatStage(HEARTBEAT_SKIP_REQUESTS_IN_FLIGHT, startedAt);
+      }
+      if (decision.kind === "idle") {
+        return skippedHeartbeatStage(decision.reason, startedAt);
+      }
+      if (decision.kind === "run") {
+        questionPrompt = decision.prompt;
+      }
+    } finally {
+      if ("release" in decision) {
+        decision.release();
+      }
     }
   }
   const { sender } = resolveHeartbeatSenderContext({ cfg, entry, delivery });

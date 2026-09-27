@@ -2,6 +2,8 @@ import { beforeEach, afterEach, describe, expect, it, onTestFinished, vi } from 
 import { createHeartbeatToolResponsePayload } from "../auto-reply/heartbeat-tool-response.js";
 import type { OpenClawConfig } from "../config/config.js";
 import { appendTranscriptMessage } from "../config/sessions/session-accessor.js";
+import type { SessionHistoryWorkerRequest } from "../config/sessions/session-history-types.js";
+import * as historyWorker from "../config/sessions/session-history-worker-runtime.js";
 import { readHeartbeatMonitorScratch, writeCronJobScratch } from "../cron/scratch-store.js";
 import { resolveCronJobsStorePath } from "../cron/store.js";
 import * as decisions from "../decisions/runtime.js";
@@ -412,6 +414,41 @@ describe("question-mode heartbeat dispatch", () => {
       expect(collector).not.toHaveBeenCalled();
       expect(result.status).toBe("ran");
       expect(String(reply.mock.calls[0]?.[0].Body)).toContain("creator-not-owner");
+    });
+  });
+
+  it("retains the wake when the session resets during the final transcript recheck", async () => {
+    vi.spyOn(decisions, "evaluateDecision").mockResolvedValue(answers());
+    // The worker API is overloaded per request kind; the fixture forwards every kind unchanged.
+    const readInWorker: (
+      request: SessionHistoryWorkerRequest,
+      signal?: AbortSignal,
+    ) => Promise<unknown> = historyWorker.readSessionHistoryPageInWorker as never;
+    let countReads = 0;
+    await withQuestions(async ({ options, reply, sessionKey, scope }) => {
+      vi.spyOn(historyWorker, "readSessionHistoryPageInWorker").mockImplementation((async (
+        request: SessionHistoryWorkerRequest,
+        signal?: AbortSignal,
+      ) => {
+        const result = await readInWorker(request, signal);
+        // The old transcript keeps its count, so only the identity event can reveal the reset.
+        if (request.kind === "message-count" && ++countReads === 2) {
+          emitSessionIdentityMutation({
+            databaseIdentity: "test",
+            agentId: "main",
+            kind: "reset",
+            previous: { sessionId: scope.sessionId, sessionKeys: [sessionKey] },
+            current: { sessionId: "replacement", sessionKeys: [sessionKey] },
+          });
+        }
+        return result;
+      }) as never);
+      expect(await runHeartbeatOnce(options)).toMatchObject({
+        status: "skipped",
+        reason: "requests-in-flight",
+      });
+      expect(countReads).toBe(2);
+      expect(reply).not.toHaveBeenCalled();
     });
   });
 

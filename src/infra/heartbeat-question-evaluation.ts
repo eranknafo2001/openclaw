@@ -293,15 +293,16 @@ export async function evaluateHeartbeatQuestions(wake: ReadyHeartbeatWake, signa
       conversationStale = true;
     }
   });
-  let result;
   try {
-    result = await evaluateGroups();
-  } finally {
+    const result = await evaluateGroups();
+    // Worker reads have no transaction to hold, so a changed transcript marks the decision stale.
+    if (countMessages && (await countMessages().catch(() => undefined)) !== initialCount) {
+      conversationStale = true;
+    }
+    // The caller releases the identity watch only after it has consumed isCurrent().
+    return { ...result, release: stopIdentityWatch };
+  } catch (error) {
     stopIdentityWatch();
+    throw error;
   }
-  // Worker reads have no transaction to hold, so a changed transcript marks the decision stale.
-  if (countMessages && (await countMessages().catch(() => undefined)) !== initialCount) {
-    conversationStale = true;
-  }
-  return result;
 }
