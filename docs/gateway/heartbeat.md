@@ -227,7 +227,9 @@ questions. Group and question IDs contain 1–64 letters, digits, underscores, o
 hyphens; question text is limited to 2,000 characters. The complete serialized
 decision request for each group, including questions and shared context, is
 capped at 24 KiB. Commands have a combined output limit of 16 KiB and a 30-second
-budget per group. These are OpenClaw limits, not the provider's token limit.
+budget per group. The whole check is limited to half of the heartbeat timeout,
+at most two minutes; when that runs out, OpenClaw starts the ordinary agent turn
+with the remaining time. These are OpenClaw limits, not the provider's token limit.
 Oversized or truncated output falls back to the ordinary agent instead of being
 treated as evidence for a no answer. The fallback asks the agent to reduce
 command output, split groups, or shorten heartbeat notes; the conversation
@@ -249,7 +251,9 @@ the question check. Existing scheduling and eligibility guards still apply.
 A yes answer starts the usual agent; it does not bypass tool policy or approvals.
 
 Groups persist alongside the notes in the existing monitor scratch storage.
-Agent updates to heartbeat notes preserve the groups. Set `mode: "agent"`
+Agent updates to heartbeat notes preserve the groups. `openclaw cron scratch`
+shows and edits only the notes and keeps saved groups; it refuses group
+documents, so manage groups with `heartbeat_questions`. Set `mode: "agent"`
 to restore ordinary heartbeats without deleting the saved groups or notes.
 Removing `mode` also restores the default unless the agent inherits `questions`
 from `agents.defaults`. Existing configurations keep ordinary

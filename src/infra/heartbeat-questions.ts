@@ -177,6 +177,29 @@ export function parseHeartbeatQuestionDocument(content = ""): HeartbeatQuestionP
   }
 }
 
+/** Scratch API view of a monitor: operators edit notes, while groups stay tool-managed. */
+export function heartbeatScratchNotesView(content: string): string {
+  const parsed = parseHeartbeatQuestionDocument(content);
+  return parsed.status === "valid" ? parsed.document.notes : content;
+}
+
+/** Replaces only a monitor's notes, preserving saved groups and their captured authority. */
+export function replaceHeartbeatScratchNotes(
+  current: string | undefined,
+  notes: string | null,
+): string | null {
+  if (notes !== null && parseHeartbeatQuestionDocument(notes).status !== "legacy") {
+    throw new Error(
+      "Heartbeat question groups are managed with the heartbeat_questions tool; write plain notes.",
+    );
+  }
+  const parsed = parseHeartbeatQuestionDocument(current);
+  if (parsed.status !== "valid" || parsed.document.groups.length === 0) {
+    return notes;
+  }
+  return serializeHeartbeatQuestionDocument({ ...parsed.document, notes: notes ?? "" });
+}
+
 export function serializeHeartbeatQuestionDocument(document: HeartbeatQuestionDocument): string {
   return JSON.stringify(normalizeDocument(document));
 }

@@ -320,6 +320,46 @@ describe("question-mode heartbeat dispatch", () => {
     },
   );
 
+  it("falls back once collection spends the preflight deadline", async () => {
+    const evaluate = vi.spyOn(decisions, "evaluateDecision").mockResolvedValue(answers());
+    const realNow = Date.now.bind(Date);
+    let offsetMs = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => realNow() + offsetMs);
+    collector.mockImplementation(async (input) => {
+      // A slow first group spends the whole budget: half of a 60-second heartbeat timeout.
+      offsetMs += 31_000;
+      return {
+        kind: "collected",
+        outputs: input.commands.map((command: string) => ({ command, output: "ok" })),
+      };
+    });
+    await withQuestions(async ({ options, reply, jobId, content }) => {
+      const parsed = parseHeartbeatQuestionDocument(content);
+      if (parsed.status === "invalid") {
+        throw new Error(parsed.error);
+      }
+      writeCronJobScratch({
+        storePath: resolveCronJobsStorePath(),
+        jobId,
+        content: serializeHeartbeatQuestionDocument({
+          ...parsed.document,
+          groups: [deploymentGroup, followupGroup],
+        }),
+      });
+      const heartbeat = options.cfg?.agents?.defaults?.heartbeat;
+      if (!heartbeat) {
+        throw new Error("Missing heartbeat config");
+      }
+      heartbeat.timeoutSeconds = 60;
+      expect((await runHeartbeatOnce(options)).status).toBe("ran");
+      expect(collector).toHaveBeenCalledOnce();
+      expect(collector.mock.calls[0]?.[0].deadlineMs).toBeGreaterThan(0);
+      expect(evaluate).not.toHaveBeenCalled();
+      expect(reply).toHaveBeenCalledOnce();
+      expect(String(reply.mock.calls[0]?.[0].Body)).toContain("preflight-deadline");
+    });
+  });
+
   it.each([
     ["still a configured owner", ["telegram:owner-1"], true],
     ["no longer an owner while the account stays configured", ["telegram:someone-else"], false],

@@ -143,6 +143,8 @@ export type HeartbeatContextCollection = {
   authority: { toolsAllow: string[]; scheduledToolPolicy: ScheduledToolPolicyContext };
   abortSignal: AbortSignal;
   isCurrent: () => boolean;
+  /** Epoch deadline for this group's collection; never extends the 30-second cap. */
+  deadlineMs?: number;
 };
 
 type CodeModeInvocation = Omit<CronScriptInvocation, "job"> & {
@@ -619,6 +621,7 @@ export function createCronScriptRuntime(deps: CronTriggerEvaluatorDeps) {
           "Heartbeat context commands require a captured exec grant and 1–5 commands.",
         );
       }
+      const remainingMs = (params.deadlineMs ?? Number.POSITIVE_INFINITY) - Date.now();
       const outputs: HeartbeatContextCommandOutput[] = [];
       let collectionFailure: Extract<CronTriggerEvaluationResult, { kind: "error" }> | undefined;
       function failCollection(
@@ -639,7 +642,7 @@ export function createCronScriptRuntime(deps: CronTriggerEvaluatorDeps) {
         state: null,
         abortSignal: params.abortSignal,
         isCurrent: params.isCurrent,
-        wallClockMs: HEADLESS_TRIGGER_WALL_CLOCK_MS,
+        wallClockMs: Math.max(1, Math.min(HEADLESS_TRIGGER_WALL_CLOCK_MS, remainingMs)),
         maxToolCalls: params.commands.length,
         label: "heartbeat context collection",
         collectOutput: (input, result) => {
