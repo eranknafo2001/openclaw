@@ -7,6 +7,7 @@ import { resolveCronJobsStorePath } from "../cron/store.js";
 import * as decisions from "../decisions/runtime.js";
 import type { DecisionOutcome } from "../decisions/types.js";
 import { DecisionContractError } from "../decisions/validation.js";
+import { emitSessionIdentityMutation } from "../sessions/session-lifecycle-events.js";
 import { getLastHeartbeatEvent, resetHeartbeatEventsForTest } from "./heartbeat-events.js";
 import {
   parseHeartbeatQuestionDocument,
@@ -514,7 +515,7 @@ describe("question-mode heartbeat dispatch", () => {
     });
   });
 
-  it.each(["questions", "event", "conversation"] as const)(
+  it.each(["questions", "event", "conversation", "reset"] as const)(
     "retains the wake when %s changes during evaluation",
     async (kind) => {
       await withQuestions(async ({ options, reply, jobId, content, sessionKey, scope }) => {
@@ -524,6 +525,15 @@ describe("question-mode heartbeat dispatch", () => {
           }
           if (kind === "event") {
             enqueueSystemEvent("New event", { sessionKey });
+          }
+          if (kind === "reset") {
+            emitSessionIdentityMutation({
+              databaseIdentity: "test",
+              agentId: "main",
+              kind: "reset",
+              previous: { sessionId: scope.sessionId, sessionKeys: [sessionKey] },
+              current: { sessionId: "replacement", sessionKeys: [sessionKey] },
+            });
           }
           if (kind === "conversation") {
             await appendTranscriptMessage(scope, {

@@ -1,11 +1,10 @@
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { getRuntimeConfigSnapshot } from "../config/config.js";
-import { loadExactSessionEntryReadOnly } from "../config/sessions/session-accessor.js";
-import { readHeartbeatMonitorScratchReadOnly } from "../cron/scratch-store.js";
-import { resolveCronJobsStorePathFromConfig } from "../cron/store.js";
+import { getPublishedCronJobScratchRevision } from "../cron/scratch-store.js";
 import { evaluateDecision } from "../decisions/runtime.js";
 import { DecisionContractError } from "../decisions/validation.js";
 import { isIncognitoSessionKey } from "../routing/session-key.js";
+import { onSessionIdentityMutation } from "../sessions/session-lifecycle-events.js";
 import { extractTextFromChatContent } from "../shared/chat-content.js";
 import { extractAssistantPhaseText } from "../shared/chat-message-content.js";
 import { getAgentEventLifecycleGeneration } from "./agent-events.js";
@@ -78,29 +77,12 @@ export async function evaluateHeartbeatQuestions(wake: ReadyHeartbeatWake, signa
     ) {
       return false;
     }
-    try {
-      const scratch = readHeartbeatMonitorScratchReadOnly(
-        resolveCronJobsStorePathFromConfig(wake.cfg),
-        wake.agentId,
-      );
-      const entry = loadExactSessionEntryReadOnly({
-        agentId: wake.agentId,
-        storePath: preflight.session.storePath,
-        sessionKey: conversationKey,
-      })?.entry;
-      if (
-        scratch?.jobId !== preflight.scratchJobId ||
-        scratch?.state.currentRevision !== preflight.scratchRevision ||
-        entry?.sessionId !== originalEntry?.sessionId ||
-        entry?.lifecycleRevision !== originalEntry?.lifecycleRevision ||
-        entry?.updatedAt !== originalEntry?.updatedAt
-      ) {
-        return false;
-      }
-      return true;
-    } catch {
-      return false;
-    }
+    // Published in-process state only: this runs around every command on the Gateway thread.
+    const published =
+      preflight.scratchJobId === undefined
+        ? undefined
+        : getPublishedCronJobScratchRevision(preflight.scratchJobId);
+    return published === undefined || published === preflight.scratchRevision;
   };
   const run = (reason: string, evidence?: string) => {
     heartbeatLog.warn("heartbeat: question check requires an agent turn", { reason });
@@ -136,46 +118,46 @@ export async function evaluateHeartbeatQuestions(wake: ReadyHeartbeatWake, signa
   let recentConversation: { role: string; text: string }[] = [];
   let countMessages: (() => Promise<number>) | undefined;
   let initialCount: number | undefined;
-  if (originalEntry) {
-    const target = {
-      agentId: wake.agentId,
-      storePath: preflight.session.storePath,
-      sessionKey: conversationKey,
-      sessionId: originalEntry.sessionId,
-      sessionEntry: { sessionId: originalEntry.sessionId },
-    };
-    const limits = { maxMessages: 20, maxLines: 420 };
-    const incognito = originalEntry.incognito || isIncognitoSessionKey(conversationKey);
-    countMessages = async () =>
-      incognito
-        ? await (
-            await import("../gateway/session-transcript-readers.js")
-          ).readSessionMessageCountAsync(target)
-        : await (
-            await import("../config/sessions/session-history-worker-runtime.js")
-          ).readSessionHistoryPageInWorker({ kind: "message-count", params: { target } }, signal);
-    try {
-      initialCount = await countMessages();
-      // Stored transcripts are read by the history worker; incognito ones stay process-held.
-      const messages = incognito
-        ? (
-            await (
-              await import("../gateway/session-transcript-readers.js")
-            ).readRecentSessionMessagesWithStatsAsync(target, limits)
-          ).messages
-        : await (
-            await import("../config/sessions/session-history-worker-runtime.js")
-          ).readSessionHistoryPageInWorker(
-            { kind: "recent", params: { target, ...limits } },
-            signal,
-          );
-      recentConversation = boundRecentConversation(messages);
-    } catch {
-      signal.throwIfAborted();
-      return run("conversation-unavailable");
-    }
-  }
   const evaluateGroups = async () => {
+    if (originalEntry) {
+      const target = {
+        agentId: wake.agentId,
+        storePath: preflight.session.storePath,
+        sessionKey: conversationKey,
+        sessionId: originalEntry.sessionId,
+        sessionEntry: { sessionId: originalEntry.sessionId },
+      };
+      const limits = { maxMessages: 20, maxLines: 420 };
+      const incognito = originalEntry.incognito || isIncognitoSessionKey(conversationKey);
+      countMessages = async () =>
+        incognito
+          ? await (
+              await import("../gateway/session-transcript-readers.js")
+            ).readSessionMessageCountAsync(target)
+          : await (
+              await import("../config/sessions/session-history-worker-runtime.js")
+            ).readSessionHistoryPageInWorker({ kind: "message-count", params: { target } }, signal);
+      try {
+        initialCount = await countMessages();
+        // Stored transcripts are read by the history worker; incognito ones stay process-held.
+        const messages = incognito
+          ? (
+              await (
+                await import("../gateway/session-transcript-readers.js")
+              ).readRecentSessionMessagesWithStatsAsync(target, limits)
+            ).messages
+          : await (
+              await import("../config/sessions/session-history-worker-runtime.js")
+            ).readSessionHistoryPageInWorker(
+              { kind: "recent", params: { target, ...limits } },
+              signal,
+            );
+        recentConversation = boundRecentConversation(messages);
+      } catch {
+        signal.throwIfAborted();
+        return run("conversation-unavailable");
+      }
+    }
     if (wake.cfg.cron?.triggers?.enabled === false) {
       return run("context-commands-disabled");
     }
@@ -299,7 +281,24 @@ export async function evaluateHeartbeatQuestions(wake: ReadyHeartbeatWake, signa
     }
     return { kind: "idle" as const, reason: "questions-no-match", isCurrent };
   };
-  const result = await evaluateGroups();
+  const stopIdentityWatch = onSessionIdentityMutation((mutation) => {
+    const keys = [
+      ...mutation.previous.sessionKeys,
+      ...(mutation.kind === "delete" ? [] : mutation.current.sessionKeys),
+    ];
+    if (
+      keys.includes(conversationKey) ||
+      mutation.previous.sessionId === originalEntry?.sessionId
+    ) {
+      conversationStale = true;
+    }
+  });
+  let result;
+  try {
+    result = await evaluateGroups();
+  } finally {
+    stopIdentityWatch();
+  }
   // Worker reads have no transaction to hold, so a changed transcript marks the decision stale.
   if (countMessages && (await countMessages().catch(() => undefined)) !== initialCount) {
     conversationStale = true;
