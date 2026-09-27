@@ -217,8 +217,9 @@ decision model sends the collected state to that provider.
 
 OpenClaw evaluates each group in a separate decision request. Each request
 includes that group's command outputs, the current time, full heartbeat notes,
-and a shared bounded slice of recent conversation: up to 6 visible user and
-assistant messages from a recent 8 KiB transcript window. Other groups' command
+and a shared bounded slice of recent conversation: the latest visible user and
+assistant messages, at most 6 messages and 8 KiB of text. A new conversation
+message during the check discards the result and retries the heartbeat. Other groups' command
 outputs are excluded. Split unrelated sources into separate groups so each
 request contains only the command evidence its questions need.
 

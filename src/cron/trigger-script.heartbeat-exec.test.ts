@@ -2,6 +2,7 @@ import fs from "node:fs";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { isConfiguredCommandOwner } from "../auto-reply/command-auth.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
 import { createOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { createCronScriptRuntime } from "./trigger-script.js";
 
@@ -41,7 +42,7 @@ describe("heartbeat context collection final command effect", () => {
     };
     const result = await createCronScriptRuntime({
       config,
-      loadPluginRegistry: () => undefined,
+      loadPluginRegistry: createEmptyPluginRegistry,
     }).collectHeartbeatContext({
       agentId: "main",
       monitorJobId: "heartbeat-main",

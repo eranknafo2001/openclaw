@@ -35,7 +35,12 @@ async function monitorWithGroups() {
   return {
     jobId,
     storePath,
-    state: createCronRegressionState({ storePath, log: logger, cronEnabled: false }),
+    state: createCronRegressionState({
+      storePath,
+      log: logger,
+      cronEnabled: false,
+      runIsolatedAgentJob: async () => ({ status: "skipped", error: "test" }),
+    }),
     stored: () =>
       parseHeartbeatQuestionDocument(readCronJobScratchState(storePath, jobId).scratch?.content),
   };
