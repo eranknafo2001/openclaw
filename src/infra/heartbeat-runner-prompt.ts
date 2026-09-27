@@ -211,7 +211,6 @@ type HeartbeatPromptResolution = {
   inspectedSystemEventsToConsume: SystemEvent[];
 };
 
-/** Appends monitor scratch prose to the generated heartbeat prompt. */
 function appendHeartbeatScratch(prompt: string, heartbeatScratchContent?: string): string {
   if (!heartbeatScratchContent) {
     return prompt;
@@ -277,9 +276,8 @@ export function resolveHeartbeatRunPrompt(input: {
 ${taskList}
 
 ${completionInstruction}`;
-    const prompt = appendHeartbeatScratch(taskPrompt, params.heartbeatScratchContent);
     return {
-      prompt,
+      prompt: appendHeartbeatScratch(taskPrompt, params.heartbeatScratchContent),
       hasTaskContinuation: hasBackgroundTaskEvent,
       hasExecCompletion: false,
       hasRelayableExecCompletion: false,
@@ -290,32 +288,20 @@ ${completionInstruction}`;
     };
   }
 
-  const baseUsesHeartbeatResponseTool = params.useHeartbeatResponseTool;
-  const basePrompt = hasExecCompletion
-    ? buildExecEventPrompt(
-        execEvents.map((event) => event.text),
-        {
-          deliverToUser: params.canRelayToUser,
-          useHeartbeatResponseTool: baseUsesHeartbeatResponseTool,
-        },
-      )
-    : hasCronEvents
-      ? buildCronEventPrompt(
-          cronEvents.map((event) => event.text),
+  const basePrompt =
+    hasExecCompletion || hasCronEvents
+      ? (hasExecCompletion ? buildExecEventPrompt : buildCronEventPrompt)(
+          (hasExecCompletion ? execEvents : cronEvents).map((event) => event.text),
           {
             deliverToUser: params.canRelayToUser,
-            useHeartbeatResponseTool: baseUsesHeartbeatResponseTool,
+            useHeartbeatResponseTool: params.useHeartbeatResponseTool,
           },
         )
-      : baseUsesHeartbeatResponseTool
+      : params.useHeartbeatResponseTool
         ? resolveHeartbeatResponseToolPrompt(params.cfg, params.heartbeat)
         : resolveConfiguredHeartbeatPrompt(params.cfg, params.heartbeat);
-  const basePromptWithDirectives = appendHeartbeatScratch(
-    basePrompt,
-    params.heartbeatScratchContent,
-  );
   return {
-    prompt: basePromptWithDirectives,
+    prompt: appendHeartbeatScratch(basePrompt, params.heartbeatScratchContent),
     hasTaskContinuation:
       hasExecCompletion ||
       hasBackgroundTaskEvent ||
@@ -323,7 +309,7 @@ ${completionInstruction}`;
     hasExecCompletion,
     hasRelayableExecCompletion,
     hasCronEvents,
-    usesHeartbeatResponseTool: baseUsesHeartbeatResponseTool,
+    usesHeartbeatResponseTool: params.useHeartbeatResponseTool,
     genericEvents,
     inspectedSystemEventsToConsume: [
       ...cronNoise,

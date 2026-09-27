@@ -122,6 +122,7 @@ describe("requester settle retry lifetime", () => {
         getLatestRunForChildSession: () => null,
         suppressAnnounceForSteerRestart: () => false,
         resolveSubagentTask: () => ({ lookup: "available" }),
+        resolveSubagentTaskAsync: unexpected,
         shouldEmitEndedHookForRun: () => false,
         emitSubagentEndedHookForRun: unexpected,
         emitSubagentProgressEndedForRun: unexpected,
@@ -140,7 +141,7 @@ describe("requester settle retry lifetime", () => {
         origin.run(() => controller.resumeRequesterSettleWake(entry.runId, entry));
         await vi.waitFor(() => {
           expect(wake).toHaveBeenCalledTimes(1);
-          expect(controller.getRequesterSettleWakeTimer(entry.runId)).toBeDefined();
+          expect(controller.scheduledRequesterSettleWakeTimers.get(entry.runId)).toBeDefined();
           expect(getActiveGatewayRootWorkCount()).toBe(0);
         });
         expect(persistedWakes).toEqual([
@@ -161,7 +162,7 @@ describe("requester settle retry lifetime", () => {
         }
         await vi.advanceTimersByTimeAsync(1_000);
         await vi.waitFor(() => {
-          expect(controller.hasScheduledRequesterSettleWakeRun(entry)).toBe(false);
+          expect(controller.scheduledRequesterSettleWakeRuns.has(entry)).toBe(false);
           expect(getActiveGatewayRootWorkCount()).toBe(0);
         });
 

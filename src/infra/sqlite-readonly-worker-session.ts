@@ -122,7 +122,23 @@ export function createSqliteReadOnlyWorkerSession(
   if (host.retainLifetime !== false) {
     void retainSnapshotWork(closed, () => retire(new Error("SQLite snapshot owner stopped")));
   }
-  child.on("error", (error) => retire(error));
+  let spawned = false;
+  child.once("spawn", () => {
+    spawned = true;
+  });
+  child.on("error", (error: NodeJS.ErrnoException) =>
+    retire(
+      spawned
+        ? error
+        : Object.assign(
+            new Error(
+              `SQLite read-only worker failed to start (executable ${process.execPath}, cwd ${cwd}): ${error.message}`,
+              { cause: error },
+            ),
+            { code: error.code },
+          ),
+    ),
+  );
   child.once("close", (code, signal) => {
     retired = true;
     if (pending) {
@@ -287,7 +303,6 @@ export function createSqliteReadOnlyWorkerSession(
                   ? {
                       auth: {
                         expectedIdentity: options.expectedIdentity,
-                        coordinatorRuntime: options.coordinatorRuntime,
                       },
                     }
                   : {}),

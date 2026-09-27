@@ -15,13 +15,17 @@ import {
   registerAcpRuntimeBackend,
   unregisterAcpRuntimeBackend,
 } from "../../../acp/runtime/registry.js";
+import * as acpSessionEntry from "../../../acp/runtime/session-meta-entry.js";
 import type { CliDeps } from "../../../cli/deps.types.js";
 import {
   clearConfigCache,
   clearRuntimeConfigSnapshot,
   getRuntimeConfig,
 } from "../../../config/config.js";
-import { loadSessionEntry } from "../../../config/sessions/session-accessor.js";
+import {
+  loadSessionEntry,
+  recordSessionParticipant,
+} from "../../../config/sessions/session-accessor.js";
 import * as sessionAccessor from "../../../config/sessions/session-accessor.js";
 import * as gatewayCall from "../../../gateway/call.js";
 import { registerChatAbortController } from "../../../gateway/chat-abort.js";
@@ -172,6 +176,13 @@ describe("pending ACP spawn authority", () => {
         sessionKey: parentSessionKey,
         defaultSessionId: "parent-session",
       });
+      const proveDelegatedCredit = stage === "runtime" && closure === "live";
+      if (proveDelegatedCredit) {
+        await recordSessionParticipant(
+          { agentId: "main", sessionKey: parentSessionKey },
+          { identity: { type: "profile", id: "human-contributor" }, promptedAt: 1 },
+        );
+      }
       const context = withLocalGatewayRequestScope(
         { deps: {} as CliDeps, getRuntimeConfig: () => cfg },
         () => getPluginRuntimeGatewayRequestScope()!.context!,
@@ -255,16 +266,21 @@ describe("pending ACP spawn authority", () => {
       }
       const lateMetadata = vi.fn();
       if (stage === "metadata") {
-        const patch = sessionAccessor.patchSessionEntryWithKey;
+        const update = acpSessionEntry.updateAcpSessionStoreEntry;
         let held = false;
-        vi.spyOn(sessionAccessor, "patchSessionEntryWithKey").mockImplementation(
-          async (...args) => {
-            const patched = await patch(...args);
-            if (!held && ensuredSessions.length > 0 && childKey) {
+        vi.spyOn(acpSessionEntry, "updateAcpSessionStoreEntry").mockImplementation(
+          async (params) => {
+            const updated = await update(params);
+            if (
+              !held &&
+              params.mutation.kind === "touch" &&
+              params.scope.sessionKey === childKey &&
+              ensuredSessions.includes(childKey)
+            ) {
               held = true;
               await pause(childKey);
             }
-            return patched;
+            return updated;
           },
         );
       }
@@ -301,6 +317,11 @@ describe("pending ACP spawn authority", () => {
       const runtime: AcpRuntime = {
         ownerAwareSessions: 1,
         async ensureSession(input) {
+          if (proveDelegatedCredit) {
+            const entry = loadSessionEntry({ sessionKey: input.sessionKey, agentId: "fixture" });
+            expect(entry?.inheritedGitContributorProfileIds).toEqual(["human-contributor"]);
+            expect(entry?.participants ?? []).toEqual([]);
+          }
           ensuredSessions.push(input.sessionKey);
           if (pausesRuntime) {
             await pause(input.sessionKey);

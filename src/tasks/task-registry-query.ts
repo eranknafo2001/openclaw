@@ -3,21 +3,21 @@ import { err, ok, type Result } from "@openclaw/normalization-core/result";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { filterCurrentTaskRunBackings } from "./task-backing-records.js";
-import { getTaskMirroredFlowIds } from "./task-flow-runtime-internal.js";
-import { clearTaskActivity } from "./task-registry-activity.js";
-import { isActiveTaskStatus } from "./task-registry-common.js";
-import { ensureLinkedTaskFlowRegistryReady } from "./task-registry-flow-link.js";
+import {
+  getTaskMirroredFlowIds,
+  prepareTaskFlowRegistryRead,
+} from "./task-flow-runtime-internal.js";
 import { clearTaskFlowSyncRetries } from "./task-registry-flow-sync.js";
 import { resetTaskRegistryListenerState } from "./task-registry-listener-state.js";
 import {
   createTaskRegistryReadPreparation,
   prepareTaskRegistryRead,
   prepareTaskRegistryReadOwner,
+  type TaskRegistryRead,
 } from "./task-registry-read.js";
 import {
   cloneTaskRecord,
   listTasksFromIndex,
-  cloneTaskRecordForObserver,
   normalizeTaskTimestamps,
   compareTasksNewestFirst,
   pickPreferredRunIdTask,
@@ -25,31 +25,19 @@ import {
 } from "./task-registry-records.js";
 import { controlRuntimeLoader, deliveryRuntimeLoader } from "./task-registry-runtime-loaders.js";
 import {
-  withTaskRegistryMutation,
-  bumpTaskRegistryRevision,
   clearTaskRegistryMemory,
-  emitTaskRegistryObserverEvent,
   ensureTaskRegistryReady,
   getTasksByRunId,
   taskRegistryLog,
   readTaskRegistryRevision,
   resetTaskRegistryRestoreState,
-  taskDeliveryStates,
   taskIdsByOwnerKey,
   taskIdsByParentFlowId,
   taskIdsByRelatedSessionKey,
   tasks,
 } from "./task-registry-state.js";
-import {
-  removeTaskIndexes,
-  recordTaskRegistryProjectionWrite,
-  getTaskRegistryProcessState,
-} from "./task-registry.process-state.js";
-import {
-  tryPersistTaskDelete,
-  getTaskRegistryStore,
-  resetTaskRegistryRuntimeForTests,
-} from "./task-registry.store.js";
+import { getTaskRegistryProcessState } from "./task-registry.process-state.js";
+import { getTaskRegistryStore, resetTaskRegistryRuntimeForTests } from "./task-registry.store.js";
 import type { TaskRecord, TaskStatus } from "./task-registry.types.js";
 import { resolveTaskSessionAgentId, taskMatchesRelatedSession } from "./task-session-identity.js";
 
@@ -324,38 +312,6 @@ export function listTaskRecords(filter?: (task: Readonly<TaskRecord>) => boolean
     .map(({ insertionIndex: _insertionIndex, ...task }) => task);
 }
 
-export function hasActiveTaskForChildSessionKey(params: {
-  sessionKey: string;
-  agentId?: string;
-  excludeTaskId?: string;
-}): boolean {
-  ensureTaskRegistryReady();
-  const sessionKey = normalizeOptionalString(params.sessionKey);
-  if (!sessionKey) {
-    return false;
-  }
-  const ids = taskIdsByRelatedSessionKey.get(sessionKey);
-  if (!ids) {
-    return false;
-  }
-  for (const taskId of ids) {
-    if (taskId === params.excludeTaskId) {
-      continue;
-    }
-    const task = tasks.get(taskId);
-    if (
-      task &&
-      isActiveTaskStatus(task.status) &&
-      normalizeOptionalString(task.childSessionKey) === sessionKey &&
-      (!params.agentId ||
-        resolveTaskSessionAgentId(task.childSessionKey, task.agentId) === params.agentId)
-    ) {
-      return true;
-    }
-  }
-  return false;
-}
-
 export function getTaskById(taskId: string): TaskRecord | undefined {
   ensureTaskRegistryReady();
   const task = tasks.get(taskId.trim());
@@ -378,6 +334,31 @@ export function findTaskByRunId(runId: string): TaskRecord | undefined {
     }),
   );
   return task ? cloneTaskRecord(task) : undefined;
+}
+
+/** Accepted task events and ACP backing facts are prepared before selecting a run. */
+export async function findTaskByRunIdAsync(
+  runId: string,
+  prepared?: TaskRegistryRead,
+): Promise<TaskRecord | undefined> {
+  const read = prepared ?? (await prepareTaskRegistryRead());
+  if (!read) {
+    throw new Error("Task lookup did not stabilize. Retry the status lookup.");
+  }
+  let matches = read.getTasksByRunId(runId);
+  const needsFlows = matches.some((task) => task.runtime === "acp" && task.childSessionKey?.trim());
+  const flows = needsFlows ? await prepareTaskFlowRegistryRead() : undefined;
+  if (needsFlows && !flows) {
+    throw new Error("Task backing lookup did not stabilize. Retry the status lookup.");
+  }
+  // Flow preparation can publish or replace task rows. Consume current admitted facts.
+  matches = read.getTasksByRunId(runId);
+  return pickPreferredRunIdTask(
+    filterCurrentTaskRunBackings(
+      matches,
+      (flowId) => flows?.getTaskFlowById(flowId)?.syncMode === "task_mirrored",
+    ),
+  );
 }
 
 export function listTasksForOwnerKey(ownerKey: string): TaskRecord[] {
@@ -501,41 +482,6 @@ export function resolveTaskForLookupToken(token: string): TaskRecord | undefined
   }
   return (
     getTaskById(lookup) ?? findTaskByRunId(lookup) ?? findLatestTaskForRelatedSessionKey(lookup)
-  );
-}
-
-export function deleteTaskRecordById(taskId: string): boolean {
-  return withTaskRegistryMutation(
-    () => {
-      ensureTaskRegistryReady();
-      const current = tasks.get(taskId);
-      if (!current) {
-        return false;
-      }
-      ensureLinkedTaskFlowRegistryReady(current);
-      // Persist the delete before mutating memory, as a single atomic store
-      // operation. If persistence fails, leave the in-memory record intact and
-      // report that no delete was applied.
-      if (!tryPersistTaskDelete(taskId)) {
-        return false;
-      }
-      const indexedCurrent = tasks.get(taskId);
-      if (indexedCurrent) {
-        removeTaskIndexes(indexedCurrent);
-      }
-      clearTaskActivity(taskId);
-      recordTaskRegistryProjectionWrite("task", taskId, true);
-      tasks.delete(taskId);
-      bumpTaskRegistryRevision();
-      taskDeliveryStates.delete(taskId);
-      emitTaskRegistryObserverEvent(() => ({
-        kind: "deleted",
-        taskId: current.taskId,
-        previous: cloneTaskRecordForObserver(current),
-      }));
-      return true;
-    },
-    () => false,
   );
 }
 
