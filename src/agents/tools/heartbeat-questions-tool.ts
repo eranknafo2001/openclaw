@@ -2,6 +2,7 @@ import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { Type } from "typebox";
 import { getRuntimeConfig } from "../../config/config.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import type { CronAuthenticatedChannelRequester } from "../../gateway/cron-creator-authority-grant.types.js";
 import { resolveHeartbeatConfig } from "../../infra/heartbeat-config.js";
 import {
   isHeartbeatQuestionModeActive,
@@ -124,11 +125,16 @@ function createHeartbeatQuestionsTool(
         const resolved = await options?.resolveCronCreatorToolAuthority?.({ signal });
         signal?.throwIfAborted();
         assertAuthority();
+        let channelRequester: CronAuthenticatedChannelRequester | undefined;
         if (resolved) {
-          const { consumeCronCreatorAuthorityGrant } =
+          const { consumeCronCreatorAuthorityGrant, resolveCronCreatorAuthorityGrantProvenance } =
             await import("../../gateway/cron-creator-authority-grant.js");
           signal?.throwIfAborted();
           assertAuthority();
+          const runId = caller?.operationalRunInstance?.runId;
+          channelRequester = runId
+            ? resolveCronCreatorAuthorityGrantProvenance(resolved.grant, runId)?.channelRequester
+            : undefined;
           consumeCronCreatorAuthorityGrant(resolved.grant);
         }
         const tools = resolved?.tools ?? options?.cronCreatorToolAllowlist;
@@ -168,6 +174,15 @@ function createHeartbeatQuestionsTool(
             "Heartbeat commands require an authenticated local or account-scoped creator turn.",
           );
         }
+        // Chat-created groups keep their owner sender so each scheduled run can recheck ownership.
+        if (
+          scheduledToolPolicy.mode === "account" &&
+          channelRequester?.accountId !== scheduledToolPolicy.ownerAccountId
+        ) {
+          throw new Error(
+            "Saving heartbeat commands from a chat requires the channel's configured command owner.",
+          );
+        }
         if (
           !Array.isArray(args.commands) ||
           !args.commands.every((command) => typeof command === "string") ||
@@ -188,7 +203,11 @@ function createHeartbeatQuestionsTool(
             id: String(question.id),
             question: String(question.question),
           })),
-          execution: { toolsAllow: ["exec"], scheduledToolPolicy },
+          execution: {
+            toolsAllow: ["exec"],
+            scheduledToolPolicy,
+            ...(scheduledToolPolicy.mode === "account" ? { channelRequester } : {}),
+          },
         });
       } else {
         document = removeHeartbeatQuestionGroup(document, id);

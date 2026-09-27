@@ -5,6 +5,8 @@ import {
 } from "../agents/scheduled-tool-policy.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { assertCronJobScratchContent } from "../cron/scratch-contract.js";
+import { normalizeCronAuthenticatedChannelRequester } from "../cron/tools-allow-provenance.js";
+import type { CronAuthenticatedChannelRequester } from "../gateway/cron-creator-authority-grant.types.js";
 
 const DOCUMENT_KIND = "openclaw-heartbeat-questions";
 const QUESTION_ID = /^[a-zA-Z0-9_-]{1,64}$/;
@@ -19,6 +21,8 @@ export type HeartbeatQuestionGroup = {
   execution: {
     toolsAllow: string[];
     scheduledToolPolicy: ScheduledToolPolicyContext;
+    /** Owner sender for chat-created groups; rechecked before every scheduled command. */
+    channelRequester?: CronAuthenticatedChannelRequester;
   };
 };
 export type HeartbeatQuestionDocument = {
@@ -91,11 +95,21 @@ function normalizeGroup(value: unknown): HeartbeatQuestionGroup {
       "Heartbeat command execution authority is missing. Re-save this group from an authorized agent turn.",
     );
   }
+  const channelRequester =
+    scheduledToolPolicy.mode === "account"
+      ? normalizeCronAuthenticatedChannelRequester(execution?.channelRequester)
+      : undefined;
   return {
     id: value.id,
     commands: value.commands.map((command: string) => command.trim()),
     questions,
-    execution: { toolsAllow: ["exec"], scheduledToolPolicy },
+    execution: {
+      toolsAllow: ["exec"],
+      scheduledToolPolicy,
+      ...(channelRequester?.accountId === scheduledToolPolicy.ownerAccountId
+        ? { channelRequester }
+        : {}),
+    },
   };
 }
 

@@ -103,7 +103,8 @@ export async function evaluateHeartbeatQuestions(wake: ReadyHeartbeatWake, signa
     return run("invalid-questions");
   }
   if (parsed.document.groups.length === 0) {
-    return { kind: "idle" as const, reason: "questions-empty", isCurrent };
+    // Notes-only monitors (including upgraded legacy prose) keep ordinary turns until groups exist.
+    return { kind: "ordinary" as const, isCurrent };
   }
   let recentConversation: { role: string; text: string }[] = [];
   if (originalEntry) {
@@ -166,6 +167,21 @@ export async function evaluateHeartbeatQuestions(wake: ReadyHeartbeatWake, signa
     if (!preflight.scratchJobId) {
       return run("monitor-unavailable");
     }
+    let groupIsCurrent = isCurrent;
+    if (group.execution.scheduledToolPolicy.mode === "account") {
+      // A chat-created grant stays usable only while its sender is still a configured owner.
+      const requester = group.execution.channelRequester;
+      const { isConfiguredCommandOwner } = await import("../auto-reply/command-auth.js");
+      const creatorIsOwner = () =>
+        requester !== undefined && isConfiguredCommandOwner(wake.cfg, requester);
+      if (!creatorIsOwner()) {
+        return run(
+          `group ${group.id}: creator-not-owner`,
+          `Group ${group.id}'s creator is no longer a configured command owner, so its commands were not run. Re-save the group from an owner turn or remove it with heartbeat_questions.`,
+        );
+      }
+      groupIsCurrent = () => isCurrent() && creatorIsOwner();
+    }
     let collected;
     try {
       collected = await runtime.collectHeartbeatContext({
@@ -175,7 +191,7 @@ export async function evaluateHeartbeatQuestions(wake: ReadyHeartbeatWake, signa
         commands: group.commands,
         authority: group.execution,
         abortSignal: signal,
-        isCurrent,
+        isCurrent: groupIsCurrent,
       });
     } catch {
       signal.throwIfAborted();

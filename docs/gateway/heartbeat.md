@@ -209,7 +209,10 @@ state. For example, the agent can make these two tool calls after replacing
 These examples require an authenticated GitHub CLI. Use commands that observe
 state, with filters and explicit output limits. Commands run under the agent's
 existing execution policy; saving a group does not authorize otherwise-blocked
-execution. Do not include credentials in command output: selecting a hosted
+execution. Groups saved from a chat require the channel's configured command
+owner and run only while that sender remains an owner and its account stays
+configured; otherwise the heartbeat skips the commands and runs the ordinary
+agent turn. Do not include credentials in command output: selecting a hosted
 decision model sends the collected state to that provider.
 
 OpenClaw evaluates each group in a separate decision request. Each request
@@ -234,7 +237,7 @@ Each question is evaluated as a Boolean probability:
 
 - Any `probabilityTrue >= 0.5` starts one ordinary heartbeat agent turn.
 - All answers in all groups below `0.5` skip the agent turn.
-- An empty group list skips the scheduled turn without commands or a decision request.
+- Until the agent saves its first group, including on an existing monitor with notes only, scheduled heartbeats run ordinary agent turns. Removing every group restores that behavior.
 - A failed or timed-out command, unavailable decision model, failed request,
   or unusable result falls back to the ordinary heartbeat turn. Cancellation
   does not start fallback work.

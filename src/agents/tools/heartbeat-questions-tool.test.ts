@@ -30,14 +30,22 @@ vi.mock("../../cron/store.js", () => ({
 
 function run(
   args: Record<string, unknown>,
-  options: { active?: () => boolean; agentId?: string; signal?: AbortSignal; exec?: boolean } = {},
+  options: {
+    active?: () => boolean;
+    agentId?: string;
+    signal?: AbortSignal;
+    exec?: boolean;
+    chat?: boolean;
+  } = {},
 ) {
   return withGatewayToolCallerIdentity(
     {
       agentId: options.agentId ?? "main",
       sessionKey: "agent:main:test",
       operationalRunInstance: { instanceId: "heartbeat-test", runId: "heartbeat-test" },
-      turnSourceLocal: true,
+      ...(options.chat
+        ? { turnSourceChannel: "telegram", turnSourceAccountId: "default" }
+        : { turnSourceLocal: true as const }),
       receiptAuthority: options.active ?? (() => true),
     },
     () => {
@@ -177,6 +185,8 @@ describe("heartbeat_questions tool", () => {
     await expect(run(args, { agentId: "other" })).rejects.toThrow("owning agent");
     await expect(run(args, { signal: AbortSignal.abort() })).rejects.toThrow();
     await expect(run(args, { exec: false })).rejects.toThrow("authorized tool surface");
+    // A chat turn without an authenticated owner sender cannot persist command authority.
+    await expect(run(args, { chat: true })).rejects.toThrow("configured command owner");
     let checks = 0;
     await expect(run(args, { active: () => ++checks === 1 })).rejects.toThrow(
       "authority is no longer active",

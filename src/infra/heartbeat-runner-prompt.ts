@@ -185,10 +185,13 @@ export async function resolveHeartbeatPreflight(params: {
     // decides whether anything needs attention.
     return basePreflight;
   }
-  if (
-    !isHeartbeatQuestionModeActive(params.cfg, params.agentId, params.heartbeat) &&
-    isHeartbeatContentEffectivelyEmpty(heartbeatScratchContent)
-  ) {
+  const parsed = parseHeartbeatQuestionDocument(heartbeatScratchContent);
+  // Saved groups replace the notes gate; without groups, question mode keeps ordinary behavior.
+  const gatedByQuestions =
+    parsed.status === "invalid" ||
+    (parsed.document.groups.length > 0 &&
+      isHeartbeatQuestionModeActive(params.cfg, params.agentId, params.heartbeat));
+  if (!gatedByQuestions && isHeartbeatContentEffectivelyEmpty(parsed.document.notes)) {
     return {
       ...basePreflight,
       skipReason: "empty-heartbeat-file",

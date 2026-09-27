@@ -470,7 +470,9 @@ export async function prepareHeartbeatRunStage(wake: ReadyHeartbeatWake) {
     if (decision.kind === "idle") {
       return skippedHeartbeatStage(decision.reason, startedAt);
     }
-    questionPrompt = decision.prompt;
+    if (decision.kind === "run") {
+      questionPrompt = decision.prompt;
+    }
   }
   const { sender } = resolveHeartbeatSenderContext({ cfg, entry, delivery });
   const replyPrefix = createReplyPrefixContext({

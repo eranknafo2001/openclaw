@@ -320,20 +320,93 @@ describe("question-mode heartbeat dispatch", () => {
     },
   );
 
-  it("settles an empty question list without either model", async () => {
+  it.each([
+    ["still a configured owner", ["telegram:owner-1"], true],
+    ["no longer an owner while the account stays configured", ["telegram:someone-else"], false],
+  ])("runs a chat-created group only while its creator is %s", async (_name, owners, runs) => {
+    vi.spyOn(decisions, "evaluateDecision").mockResolvedValue(answers());
+    await withQuestions(async ({ options, reply, jobId, content }) => {
+      const parsed = parseHeartbeatQuestionDocument(content);
+      if (parsed.status === "invalid") {
+        throw new Error(parsed.error);
+      }
+      writeCronJobScratch({
+        storePath: resolveCronJobsStorePath(),
+        jobId,
+        content: serializeHeartbeatQuestionDocument({
+          ...parsed.document,
+          groups: [
+            {
+              ...deploymentGroup,
+              execution: {
+                toolsAllow: ["exec"],
+                scheduledToolPolicy: {
+                  version: 1,
+                  mode: "account",
+                  ownerSessionKey: "agent:main:telegram:direct:owner-1",
+                  ownerAccountId: "default",
+                },
+                channelRequester: {
+                  version: 1,
+                  channel: "telegram",
+                  accountId: "default",
+                  senderId: "owner-1",
+                },
+              },
+            },
+          ],
+        }),
+      });
+      const cfg = options.cfg;
+      if (!cfg) {
+        throw new Error("Missing config");
+      }
+      cfg.commands = { ownerAllowFrom: owners };
+      const result = await runHeartbeatOnce(options);
+      if (runs) {
+        expect(collector).toHaveBeenCalledOnce();
+        expect(result).toEqual({ status: "skipped", reason: "questions-no-match" });
+        return;
+      }
+      expect(collector).not.toHaveBeenCalled();
+      expect(result.status).toBe("ran");
+      expect(String(reply.mock.calls[0]?.[0].Body)).toContain("creator-not-owner");
+    });
+  });
+
+  it.each([
+    ["legacy notes-only monitor", "Existing notes", "ran"],
+    ["envelope with every group removed", "envelope", "ran"],
+    ["legacy empty notes", "", "skipped"],
+  ] as const)("keeps ordinary heartbeats for a %s", async (_name, scratch, expected) => {
     const evaluate = vi.spyOn(decisions, "evaluateDecision").mockResolvedValue(answers());
     await withQuestions(async ({ options, reply, jobId }) => {
       writeCronJobScratch({
         storePath: resolveCronJobsStorePath(),
         jobId,
-        content: "Existing notes",
+        content:
+          scratch === "envelope"
+            ? serializeHeartbeatQuestionDocument({
+                kind: "openclaw-heartbeat-questions",
+                version: 2,
+                notes: "Existing notes",
+                groups: [],
+              })
+            : scratch,
       });
-      expect(await runHeartbeatOnce(options)).toEqual({
-        status: "skipped",
-        reason: "questions-empty",
-      });
+      const result = await runHeartbeatOnce(options);
       expect(evaluate).not.toHaveBeenCalled();
-      expect(reply).not.toHaveBeenCalled();
+      expect(collector).not.toHaveBeenCalled();
+      if (expected === "skipped") {
+        expect(result).toEqual({ status: "skipped", reason: "empty-heartbeat-file" });
+        expect(reply).not.toHaveBeenCalled();
+        return;
+      }
+      expect(result.status).toBe("ran");
+      expect(reply).toHaveBeenCalledOnce();
+      const prompt = String(reply.mock.calls[0]?.[0].Body);
+      expect(prompt).toContain("Existing notes");
+      expect(prompt).not.toContain("openclaw-heartbeat-questions");
     });
   });
 
