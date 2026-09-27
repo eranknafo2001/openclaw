@@ -452,6 +452,35 @@ describe("question-mode heartbeat dispatch", () => {
     });
   });
 
+  it("runs the ordinary turn when the final recheck outlasts the preflight deadline", async () => {
+    vi.spyOn(decisions, "evaluateDecision").mockResolvedValue(answers());
+    const realNow = Date.now.bind(Date);
+    let offsetMs = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => realNow() + offsetMs);
+    const readInWorker: (
+      request: SessionHistoryWorkerRequest,
+      signal?: AbortSignal,
+    ) => Promise<unknown> = historyWorker.readSessionHistoryPageInWorker as never;
+    let countReads = 0;
+    vi.spyOn(historyWorker, "readSessionHistoryPageInWorker").mockImplementation((async (
+      request: SessionHistoryWorkerRequest,
+      signal?: AbortSignal,
+    ) => {
+      if (request.kind === "message-count" && ++countReads === 2) {
+        // A slow final read spends the budget reserved for the fallback turn.
+        offsetMs += 150_000;
+        throw new Error("history worker deadline");
+      }
+      return await readInWorker(request, signal);
+    }) as never);
+    await withQuestions(async ({ options, reply }) => {
+      expect((await runHeartbeatOnce(options)).status).toBe("ran");
+      expect(countReads).toBe(2);
+      expect(reply).toHaveBeenCalledOnce();
+      expect(String(reply.mock.calls[0]?.[0].Body)).toContain("preflight-deadline");
+    });
+  });
+
   it.each([
     ["legacy notes-only monitor", "Existing notes", "ran"],
     ["envelope with every group removed", "envelope", "ran"],

@@ -115,6 +115,31 @@ export async function evaluateHeartbeatQuestions(wake: ReadyHeartbeatWake, signa
     // Notes-only monitors (including upgraded legacy prose) keep ordinary turns until groups exist.
     return { kind: "ordinary" as const, isCurrent };
   }
+  // The heartbeat watchdog covers this check and the agent turn; keep half for the turn.
+  const timeoutSeconds = resolveHeartbeatTimeoutOverrideSeconds(wake.cfg, wake.heartbeat);
+  const deadlineMs =
+    wake.startedAt +
+    (timeoutSeconds > 0
+      ? Math.min(MAX_PREFLIGHT_MS, (timeoutSeconds * 1000) / 2)
+      : MAX_PREFLIGHT_MS);
+  const deadlineReason = `preflight-deadline. Too many groups or slow checks for this heartbeat interval; reduce groups or command time`;
+  const deadlineSignal = AbortSignal.any([
+    signal,
+    AbortSignal.timeout(Math.max(1, deadlineMs - Date.now())),
+  ]);
+  // Readers without a signal (incognito) still settle this check by the deadline.
+  const withinDeadline = <T>(read: Promise<T>) =>
+    new Promise<T>((resolve, reject) => {
+      const onAbort = () => reject(deadlineSignal.reason);
+      if (deadlineSignal.aborted) {
+        onAbort();
+        return;
+      }
+      deadlineSignal.addEventListener("abort", onAbort, { once: true });
+      read.then(resolve, reject).finally(() => {
+        deadlineSignal.removeEventListener("abort", onAbort);
+      });
+    });
   let recentConversation: { role: string; text: string }[] = [];
   let countMessages: (() => Promise<number>) | undefined;
   let initialCount: number | undefined;
@@ -130,32 +155,39 @@ export async function evaluateHeartbeatQuestions(wake: ReadyHeartbeatWake, signa
       const limits = { maxMessages: 20, maxLines: 420 };
       const incognito = originalEntry.incognito || isIncognitoSessionKey(conversationKey);
       countMessages = async () =>
-        incognito
-          ? await (
-              await import("../gateway/session-transcript-readers.js")
-            ).readSessionMessageCountAsync(target)
-          : await (
-              await import("../config/sessions/session-history-worker-runtime.js")
-            ).readSessionHistoryPageInWorker({ kind: "message-count", params: { target } }, signal);
+        await withinDeadline(
+          incognito
+            ? (
+                await import("../gateway/session-transcript-readers.js")
+              ).readSessionMessageCountAsync(target)
+            : (
+                await import("../config/sessions/session-history-worker-runtime.js")
+              ).readSessionHistoryPageInWorker(
+                { kind: "message-count", params: { target } },
+                deadlineSignal,
+              ),
+        );
       try {
         initialCount = await countMessages();
         // Stored transcripts are read by the history worker; incognito ones stay process-held.
         const messages = incognito
           ? (
-              await (
-                await import("../gateway/session-transcript-readers.js")
-              ).readRecentSessionMessagesWithStatsAsync(target, limits)
+              await withinDeadline(
+                (
+                  await import("../gateway/session-transcript-readers.js")
+                ).readRecentSessionMessagesWithStatsAsync(target, limits),
+              )
             ).messages
           : await (
               await import("../config/sessions/session-history-worker-runtime.js")
             ).readSessionHistoryPageInWorker(
               { kind: "recent", params: { target, ...limits } },
-              signal,
+              deadlineSignal,
             );
         recentConversation = boundRecentConversation(messages);
       } catch {
         signal.throwIfAborted();
-        return run("conversation-unavailable");
+        return run(Date.now() >= deadlineMs ? deadlineReason : "conversation-unavailable");
       }
     }
     if (wake.cfg.cron?.triggers?.enabled === false) {
@@ -163,14 +195,6 @@ export async function evaluateHeartbeatQuestions(wake: ReadyHeartbeatWake, signa
     }
     const { createCronScriptRuntime } = await import("../cron/trigger-script.js");
     const runtime = createCronScriptRuntime({ config: wake.cfg });
-    // The heartbeat watchdog covers this check and the agent turn; keep half for the turn.
-    const timeoutSeconds = resolveHeartbeatTimeoutOverrideSeconds(wake.cfg, wake.heartbeat);
-    const deadlineMs =
-      wake.startedAt +
-      (timeoutSeconds > 0
-        ? Math.min(MAX_PREFLIGHT_MS, (timeoutSeconds * 1000) / 2)
-        : MAX_PREFLIGHT_MS);
-    const deadlineReason = `preflight-deadline. Too many groups or slow checks for this heartbeat interval; reduce groups or command time`;
     for (const group of parsed.document.groups) {
       if (!isCurrent()) {
         return { kind: "idle" as const, reason: "questions-stale", isCurrent };
@@ -296,11 +320,19 @@ export async function evaluateHeartbeatQuestions(wake: ReadyHeartbeatWake, signa
   try {
     const result = await evaluateGroups();
     // Worker reads have no transaction to hold, so a changed transcript marks the decision stale.
-    if (countMessages && (await countMessages().catch(() => undefined)) !== initialCount) {
-      conversationStale = true;
+    let settled = result;
+    if (countMessages) {
+      const finalCount = await countMessages().catch(() => undefined);
+      signal.throwIfAborted();
+      if (finalCount === undefined && result.kind === "idle" && Date.now() >= deadlineMs) {
+        // An unconfirmed all-no result never consumes the fallback turn's reserved time.
+        settled = run(deadlineReason);
+      } else if (finalCount !== initialCount) {
+        conversationStale = true;
+      }
     }
     // The caller releases the identity watch only after it has consumed isCurrent().
-    return { ...result, release: stopIdentityWatch };
+    return { ...settled, release: stopIdentityWatch };
   } catch (error) {
     stopIdentityWatch();
     throw error;
