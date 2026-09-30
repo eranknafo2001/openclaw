@@ -84,9 +84,14 @@ function createHeartbeatQuestionsTool(
       signal?.throwIfAborted();
       assertAuthority();
       const [
-        { readHeartbeatMonitorScratch, writeCronJobScratch },
+        { writeCronJobScratch },
         { resolveCronJobsStorePathFromConfig },
-      ] = await Promise.all([import("../../cron/scratch-store.js"), import("../../cron/store.js")]);
+        { readCronScratchSnapshot },
+      ] = await Promise.all([
+        import("../../cron/scratch-store.js"),
+        import("../../cron/store.js"),
+        import("../../cron/scratch-read.js"),
+      ]);
       signal?.throwIfAborted();
       assertAuthority();
       const config = getRuntimeConfig();
@@ -102,7 +107,17 @@ function createHeartbeatQuestionsTool(
         );
       }
       const storePath = resolveCronJobsStorePathFromConfig(config);
-      const monitor = readHeartbeatMonitorScratch(storePath, sessionAgentId);
+      const monitor = await readCronScratchSnapshot(
+        storePath,
+        { kind: "heartbeat", agentId: sessionAgentId },
+        {},
+        { assertCurrent: assertAuthority, signal },
+      );
+      signal?.throwIfAborted();
+      assertAuthority();
+      if (getRuntimeConfig() !== config) {
+        throw new Error("Heartbeat configuration changed. Retry from a current agent turn.");
+      }
       if (!monitor) {
         throw new Error(
           "Heartbeat monitor is missing. Enable Cron and this agent's heartbeat, then start the Gateway or run openclaw doctor to reconcile monitors.",
@@ -218,12 +233,23 @@ function createHeartbeatQuestionsTool(
       if (getRuntimeConfig() !== config) {
         throw new Error("Heartbeat configuration changed. Retry from a current agent turn.");
       }
-      const result = writeCronJobScratch({
-        storePath,
-        jobId: monitor.jobId,
-        expectedRevision: monitor.state.currentRevision,
-        content,
-      });
+      const result = await writeCronJobScratch(
+        {
+          storePath,
+          jobId: monitor.jobId,
+          expectedRevision: monitor.state.currentRevision,
+          content,
+        },
+        {
+          assertCurrent() {
+            signal?.throwIfAborted();
+            assertAuthority();
+            if (getRuntimeConfig() !== config) {
+              throw new Error("Heartbeat configuration changed. Retry from a current agent turn.");
+            }
+          },
+        },
+      );
       if (!result.ok) {
         throw new Error(
           "Heartbeat questions changed concurrently. List current questions and retry.",

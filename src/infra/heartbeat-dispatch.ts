@@ -33,7 +33,8 @@ import {
 } from "../config/sessions/session-accessor.js";
 import { resolveMirroredTranscriptText } from "../config/sessions/transcript-mirror.js";
 import { mergeSessionEntry } from "../config/sessions/types.js";
-import { readCronJobScratchState, writeCronJobScratch } from "../cron/scratch-store.js";
+import { readCronScratchSnapshot } from "../cron/scratch-read.js";
+import { writeCronJobScratch } from "../cron/scratch-store.js";
 import { resolveCronJobsStorePathFromConfig } from "../cron/store.js";
 import { resolveAgentIdFromSessionKey } from "../routing/session-key.js";
 import { formatErrorMessage } from "./errors.js";
@@ -44,6 +45,7 @@ import { heartbeatLog as log } from "./heartbeat-log.js";
 import { persistHeartbeatOutcome } from "./heartbeat-outcome-store.js";
 import {
   parseHeartbeatQuestionDocument,
+  replaceHeartbeatScratchNotes,
   serializeHeartbeatQuestionDocument,
 } from "./heartbeat-questions.js";
 import { resolveHeartbeatChannelPlugin } from "./heartbeat-runner-config.js";
@@ -236,29 +238,47 @@ async function prepareHeartbeatDispatchReply(
       log.warn("heartbeat: scratch update ignored because no monitor job exists");
     } else {
       try {
+        const owner = runState.agentTurnOwner;
+        const assertCurrent = () => {
+          if (runState.agentTurnOwner !== owner || resolveReplyOperationAbortReason(owner)) {
+            throw new Error("Heartbeat scratch writer is no longer current");
+          }
+        };
         const cronStorePath = resolveCronJobsStorePathFromConfig(cfg);
-        let content = scratch;
-        let expectedRevision = preflight.scratchRevision ?? 0;
-        const current = readCronJobScratchState(cronStorePath, preflight.scratchJobId);
+        const monitor = await readCronScratchSnapshot(
+          cronStorePath,
+          { kind: "heartbeat", agentId: policy.wake.agentId },
+          {},
+          { assertCurrent },
+        );
+        if (!monitor || monitor.jobId !== preflight.scratchJobId) {
+          throw new Error("Heartbeat monitor changed during scratch update");
+        }
+        const current = monitor.state;
         const parsed = parseHeartbeatQuestionDocument(current.scratch?.content);
         if (parsed.status === "invalid") {
           throw new Error("Invalid heartbeat question document; notes were not overwritten");
         }
+        // Response scratch can update notes, but cannot mint captured command authority.
+        let content = replaceHeartbeatScratchNotes(current.scratch?.content, scratch);
+        let expectedRevision = preflight.scratchRevision ?? 0;
         if (parsed.status === "valid" || policy.wake.heartbeat?.mode === "questions") {
           const original = parseHeartbeatQuestionDocument(preflight.heartbeatScratchContent);
-          // Question edits may advance scratch during this turn. Merge only when notes
-          // still match the input, preserving concurrent edits to either responsibility.
+          // Preserve tool edits while refusing concurrent changes to the notes themselves.
           if (original.status !== "invalid" && original.document.notes === parsed.document.notes) {
             expectedRevision = current.currentRevision;
           }
           content = serializeHeartbeatQuestionDocument({ ...parsed.document, notes: scratch });
         }
-        const written = writeCronJobScratch({
-          storePath: cronStorePath,
-          jobId: preflight.scratchJobId,
-          content,
-          expectedRevision,
-        });
+        const written = await writeCronJobScratch(
+          {
+            storePath: cronStorePath,
+            jobId: preflight.scratchJobId,
+            content,
+            expectedRevision,
+          },
+          { assertCurrent },
+        );
         if (!written.ok) {
           log.warn("heartbeat: scratch update lost a concurrent revision race");
         }

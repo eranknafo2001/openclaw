@@ -1,5 +1,9 @@
 import crypto from "node:crypto";
-import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { createHeartbeatContextCollector } from "./heartbeat-context-collector.js";
+export type {
+  HeartbeatContextCollection,
+  HeartbeatContextCommandOutput,
+} from "./heartbeat-context-collector.js";
 import {
   createOperationalRunInstanceRef,
   prepareAgentRunAdmission,
@@ -36,9 +40,14 @@ import {
   type CodeModeHeadlessResult,
 } from "../agents/code-mode.js";
 import {
+  resolveConversationCapabilityProfile,
+  type ResolvedConversationCapabilityProfile,
+} from "../agents/conversation-capability-profile.js";
+import {
   applyEmbeddedAttemptToolsAllow,
   resolveEmbeddedAttemptToolConstructionPlan,
 } from "../agents/embedded-agent-runner/run/attempt-tool-construction-plan.js";
+import { runAgentCleanupStep } from "../agents/run-cleanup-timeout.js";
 import { loadAgentRuntimePluginRegistryHandle } from "../agents/runtime-plugins.js";
 import { resolveSandboxContext } from "../agents/sandbox.js";
 import {
@@ -61,6 +70,7 @@ import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { GatewayContextResolver } from "../gateway/server-methods/types.js";
 import { formatErrorMessageWithCode } from "../infra/errors.js";
 import { pruneMapToMaxSize } from "../infra/map-size.js";
+import { logWarn } from "../logger.js";
 import { PluginInstanceUnavailableError } from "../plugins/plugin-instance-error.js";
 import { capturePluginLifecycleAuthority } from "../plugins/registry-lifecycle.js";
 import type { PluginRegistry } from "../plugins/registry-types.js";
@@ -83,6 +93,7 @@ import {
   MAX_CRON_SCRIPT_TOOL_BUDGET,
 } from "./script-payload.js";
 import type { CronServiceDeps } from "./service/state.js";
+import { acquireCronScriptMcpTools, type CronScriptMcpTools } from "./trigger-script-mcp.js";
 import {
   parseScriptPayloadResult,
   parseTriggerResult,
@@ -99,6 +110,9 @@ const MAX_CONCURRENT_TRIGGER_EVALS = 3;
 const MAX_CACHED_TRIGGER_RUNTIMES = 128;
 const HEADLESS_TRIGGER_WALL_CLOCK_MS = 30_000;
 const HEADLESS_TRIGGER_TOOL_BUDGET = 5;
+// Holds a finished evaluation for MCP teardown at most this long; a hung connect or shutdown
+// keeps retiring as tracked work instead of holding the result and trigger slot.
+const CRON_SCRIPT_MCP_CLEANUP_GRACE_MS = 1_000;
 
 let activeTriggerEvaluations = 0;
 
@@ -114,6 +128,11 @@ void assertTriggerCodesCoverHeadless;
 
 type PreparedTriggerRuntime = {
   createTools: (admitted: AdmittedRunContext, signal: AbortSignal) => AnyAgentTool[];
+  /** Starts this evaluation's own MCP runtime for servers its toolsAllow names by prefix. */
+  acquireMcpTools?: (
+    admitted: AdmittedRunContext,
+    reservedToolNames: readonly string[],
+  ) => CronScriptMcpTools | undefined;
   context: HookContext & { config: OpenClawConfig; agentId: string; sessionKey: string };
   pluginRegistry?: PluginRegistry;
 };
@@ -131,21 +150,6 @@ type PrepareTriggerRuntime = (params: {
   heartbeatCollector?: boolean;
   sessionKey?: string;
 }) => Promise<PreparedTriggerRuntime>;
-
-export type HeartbeatContextCommandOutput = { command: string; output: string };
-
-export type HeartbeatContextCollection = {
-  agentId: string;
-  monitorJobId: string;
-  sessionKey: string;
-  commands: string[];
-  /** Captured by the server from the registering agent's final tool surface. */
-  authority: { toolsAllow: string[]; scheduledToolPolicy: ScheduledToolPolicyContext };
-  abortSignal: AbortSignal;
-  isCurrent: () => boolean;
-  /** Epoch deadline for this group's collection; never extends the 30-second cap. */
-  deadlineMs?: number;
-};
 
 type CodeModeInvocation = Omit<CronScriptInvocation, "job"> & {
   jobId: string;
@@ -259,7 +263,36 @@ async function prepareTriggerRuntime(
       toolsEnabled: true,
       toolsAllow: params.toolsAllow,
     });
-    // Bundle MCP tools are source:"mcp", which the headless bridge excludes.
+    const scheduledToolPolicy = resolveScheduledToolPolicyContext({
+      toolsAllow: params.toolsAllow,
+      scheduledToolPolicy: params.scheduledToolPolicy,
+      execTarget: params.execTarget,
+    });
+    // Core and MCP tools of one evaluation share one policy owner, like embedded runs.
+    const capabilityProfiles = new WeakMap<
+      AdmittedRunContext,
+      ResolvedConversationCapabilityProfile
+    >();
+    const resolveCapabilityProfile = (admitted: AdmittedRunContext) => {
+      let profile = capabilityProfiles.get(admitted);
+      if (!profile) {
+        profile = resolveConversationCapabilityProfile({
+          config,
+          sessionKey,
+          runId: admitted.operationalRunInstance.runId,
+          agentId,
+          workspaceDir: effectiveWorkspace,
+          cwd: effectiveWorkspace,
+          spawnWorkspaceDir: workspaceDir,
+          sandboxToolPolicy: sandbox?.enabled ? sandbox.tools : undefined,
+          runtimeToolAllowlist: toolPlan.runtimeToolAllowlist,
+          inheritRuntimeToolAllowlist: Boolean(toolPlan.runtimeToolAllowlist),
+          scheduledToolPolicy,
+        });
+        capabilityProfiles.set(admitted, profile);
+      }
+      return profile;
+    };
     // LSP runtimes are session-scoped and intentionally outside trigger v1.
     const createTools: PreparedTriggerRuntime["createTools"] = (admitted, signal) => {
       const allTools = toolPlan.constructTools
@@ -287,11 +320,8 @@ async function prepareTriggerRuntime(
             includeCoreTools: toolPlan.includeCoreTools,
             runtimeToolAllowlist: toolPlan.runtimeToolAllowlist,
             inheritRuntimeToolAllowlist: Boolean(toolPlan.runtimeToolAllowlist),
-            scheduledToolPolicy: resolveScheduledToolPolicyContext({
-              toolsAllow: params.toolsAllow,
-              scheduledToolPolicy: params.scheduledToolPolicy,
-              execTarget: params.execTarget,
-            }),
+            scheduledToolPolicy,
+            conversationCapabilityProfile: resolveCapabilityProfile(admitted),
             toolConstructionPlan: toolPlan.codingToolConstructionPlan,
           })
         : [];
@@ -307,8 +337,27 @@ async function prepareTriggerRuntime(
       sessionKey,
       loopDetection: resolveToolLoopDetectionConfig({ cfg: config, agentId }),
     };
+    const acquireMcpTools: PreparedTriggerRuntime["acquireMcpTools"] = (
+      admitted,
+      reservedToolNames,
+    ) => {
+      const runId = admitted.operationalRunInstance.runId;
+      return acquireCronScriptMcpTools({
+        sessionId: runId,
+        sessionKey,
+        agentId,
+        config,
+        workspaceDir: effectiveWorkspace,
+        agentDir,
+        toolsAllow: params.toolsAllow,
+        capabilityProfile: resolveCapabilityProfile(admitted),
+        reservedToolNames,
+        hookContext: { ...context, runId, trigger: "cron" },
+      });
+    };
     return {
       createTools,
+      acquireMcpTools,
       context,
       ...(pluginRegistry ? { pluginRegistry } : {}),
     };
@@ -333,7 +382,8 @@ function triggerStateNamespace(state: unknown, streamBatch?: string): CodeModeNa
   };
 }
 
-function createCronCodeModeRunner(deps: CronTriggerEvaluatorDeps) {
+/** Builds the admitted headless runner shared by cron and heartbeat collection. */
+export function createCronCodeModeRunner(deps: CronTriggerEvaluatorDeps) {
   const runHeadless = deps.runHeadless ?? runCodeModeScriptHeadless;
   const prepareRuntime =
     deps.prepareRuntime ?? ((params) => prepareTriggerRuntime(params, deps.loadPluginRegistry));
@@ -427,7 +477,9 @@ function createCronCodeModeRunner(deps: CronTriggerEvaluatorDeps) {
       params.label,
     );
     const catalogRef = createToolSearchCatalogRef();
+    const runId = `cron-trigger:${params.jobId}:${crypto.randomUUID()}`;
     let admission: PreparedAgentRunAdmission | undefined;
+    let mcp: CronScriptMcpTools | undefined;
     try {
       const request = {
         runtimeConfig: resolveCronActiveRuntimeConfig(deps.config),
@@ -439,7 +491,6 @@ function createCronCodeModeRunner(deps: CronTriggerEvaluatorDeps) {
         sessionKey: params.sessionKey,
         heartbeatCollector: params.heartbeatCollector,
       };
-      const runId = `cron-trigger:${params.jobId}:${crypto.randomUUID()}`;
       let runtime: CachedTriggerRuntime | undefined;
       let tools: AnyAgentTool[];
       let admitted: AdmittedRunContext | undefined;
@@ -503,6 +554,13 @@ function createCronCodeModeRunner(deps: CronTriggerEvaluatorDeps) {
           if (!runtime.isCurrent()) {
             throw new PluginInstanceUnavailableError();
           }
+          // A script that never names MCP cannot reach it, so it starts no server.
+          if (/\bMCP\b/.test(params.script)) {
+            const reservedToolNames = tools.map((tool) => tool.name);
+            mcp = withPluginRuntimeRegistryScope(selected.pluginRegistry, () =>
+              selected.acquireMcpTools?.(authority, reservedToolNames),
+            );
+          }
           break;
         } catch (error) {
           if (
@@ -525,6 +583,13 @@ function createCronCodeModeRunner(deps: CronTriggerEvaluatorDeps) {
           runtime?.invalidate();
           // Retry setup once with the same admission and deadline, never script execution.
         }
+      }
+      let mcpUnavailable: string | undefined;
+      if (mcp) {
+        // Server connection and tool listing spend the evaluation's own deadline.
+        const surface = await evaluationScope.wait(mcp.surface);
+        tools = [...tools, ...surface.tools];
+        mcpUnavailable = surface.unavailable;
       }
       const ctx: ToolSearchToolContext = {
         ...runtime.context,
@@ -580,7 +645,11 @@ function createCronCodeModeRunner(deps: CronTriggerEvaluatorDeps) {
           signal: evaluationScope.signal,
         });
         if (result.status === "failed") {
-          return scriptFailure(result.error, result.code);
+          // A failed server is absent from `MCP`; name why when the script fails.
+          return scriptFailure(
+            mcpUnavailable ? `${result.error} (${mcpUnavailable})` : result.error,
+            result.code,
+          );
         }
         assertActive();
         return { kind: "completed" as const, result };
@@ -598,6 +667,16 @@ function createCronCodeModeRunner(deps: CronTriggerEvaluatorDeps) {
       admission?.close();
       clearToolSearchCatalog({ catalogRef });
       evaluationScope.cleanup();
+      if (mcp) {
+        await runAgentCleanupStep({
+          runId,
+          sessionId: runId,
+          step: "cron-script-mcp-retire",
+          timeoutMs: CRON_SCRIPT_MCP_CLEANUP_GRACE_MS,
+          log: { warn: logWarn },
+          cleanup: mcp.dispose,
+        });
+      }
     }
   };
 }
@@ -605,89 +684,7 @@ function createCronCodeModeRunner(deps: CronTriggerEvaluatorDeps) {
 export function createCronScriptRuntime(deps: CronTriggerEvaluatorDeps) {
   const run = createCronCodeModeRunner(deps);
   return {
-    collectHeartbeatContext: async (
-      params: HeartbeatContextCollection,
-    ): Promise<
-      | { kind: "collected"; outputs: HeartbeatContextCommandOutput[] }
-      | { kind: "error"; code: CronTriggerFailureCode; error: string }
-    > => {
-      if (
-        params.commands.length < 1 ||
-        params.commands.length > 5 ||
-        params.commands.some((command) => !command.trim()) ||
-        !params.authority.toolsAllow.includes("exec")
-      ) {
-        return scriptFailure(
-          "Heartbeat context commands require a captured exec grant and 1–5 commands.",
-        );
-      }
-      const remainingMs = (params.deadlineMs ?? Number.POSITIVE_INFINITY) - Date.now();
-      const outputs: HeartbeatContextCommandOutput[] = [];
-      let collectionFailure: Extract<CronTriggerEvaluationResult, { kind: "error" }> | undefined;
-      function failCollection(
-        error: string,
-        code: CronTriggerFailureCode = "internal_error",
-      ): never {
-        collectionFailure = scriptFailure(error, code);
-        throw new Error(error);
-      }
-      const outcome = await run({
-        jobId: params.monitorJobId,
-        agentId: params.agentId,
-        sessionKey: params.sessionKey,
-        toolsAllow: ["exec"],
-        scheduledToolPolicy: params.authority.scheduledToolPolicy,
-        heartbeatCollector: true,
-        script: `for (const command of ${JSON.stringify(params.commands)}) { await exec({ command, timeoutSeconds: 25, background: false }); }`,
-        state: null,
-        abortSignal: params.abortSignal,
-        isCurrent: params.isCurrent,
-        wallClockMs: Math.max(1, Math.min(HEADLESS_TRIGGER_WALL_CLOCK_MS, remainingMs)),
-        maxToolCalls: params.commands.length,
-        label: "heartbeat context collection",
-        collectOutput: (input, result) => {
-          const details = isRecord(result) ? result.details : undefined;
-          if (
-            !isRecord(input) ||
-            typeof input.command !== "string" ||
-            !isRecord(details) ||
-            details.status !== "completed" ||
-            details.exitCode !== 0 ||
-            typeof details.aggregated !== "string"
-          ) {
-            failCollection(
-              "Heartbeat context command failed or requires approval; inspect the group's commands.",
-            );
-          }
-          if (details.truncated !== false) {
-            failCollection(
-              "Heartbeat context output is incomplete; narrow or split the commands.",
-              "output_limit_exceeded",
-            );
-          }
-          outputs.push({ command: input.command, output: details.aggregated });
-          if (Buffer.byteLength(JSON.stringify(outputs), "utf8") > 16 * 1024) {
-            failCollection(
-              "Heartbeat context output exceeds 16 KiB; narrow or split the commands.",
-              "output_limit_exceeded",
-            );
-          }
-        },
-      });
-      if (collectionFailure) {
-        return collectionFailure;
-      }
-      if (outcome.kind === "error") {
-        // Tool/provider errors can include command text or output; only the failure class leaves this collector.
-        return scriptFailure(
-          `Heartbeat context collection failed (${outcome.code}).`,
-          outcome.code,
-        );
-      }
-      return outputs.length === params.commands.length
-        ? { kind: "collected", outputs }
-        : scriptFailure("Heartbeat context collection returned incomplete command results.");
-    },
+    collectHeartbeatContext: createHeartbeatContextCollector(run),
     evaluateTrigger: async (params: CronScriptInvocation): Promise<CronTriggerEvaluationResult> => {
       if (activeTriggerEvaluations >= MAX_CONCURRENT_TRIGGER_EVALS) {
         return { kind: "busy" };

@@ -21,9 +21,9 @@ const mocks = vi.hoisted(() => ({
 }));
 vi.mock("../../config/config.js", () => ({ getRuntimeConfig: () => mocks.config }));
 vi.mock("../../cron/scratch-store.js", () => ({
-  readHeartbeatMonitorScratch: mocks.read,
   writeCronJobScratch: mocks.write,
 }));
+vi.mock("../../cron/scratch-read.js", () => ({ readCronScratchSnapshot: mocks.read }));
 vi.mock("../../cron/store.js", () => ({
   resolveCronJobsStorePathFromConfig: () => "/isolated/cron",
 }));
@@ -107,9 +107,15 @@ describe("heartbeat_questions tool", () => {
       commands: ["deployment-status"],
       questions: [{ id: "blocked", question: "Is deployment blocked?" }],
     });
-    expect(mocks.read).toHaveBeenCalledWith("/isolated/cron", "main");
+    expect(mocks.read).toHaveBeenCalledWith(
+      "/isolated/cron",
+      { kind: "heartbeat", agentId: "main" },
+      {},
+      expect.objectContaining({ assertCurrent: expect.any(Function) }),
+    );
     expect(mocks.write).toHaveBeenCalledWith(
       expect.objectContaining({ jobId: "monitor-main", expectedRevision: 4 }),
+      expect.objectContaining({ assertCurrent: expect.any(Function) }),
     );
     const parsed = parseHeartbeatQuestionDocument(mocks.write.mock.calls[0]?.[0]?.content);
     expect(parsed).toMatchObject({

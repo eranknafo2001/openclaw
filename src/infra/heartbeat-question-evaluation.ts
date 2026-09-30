@@ -1,17 +1,20 @@
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { getRuntimeConfigSnapshot } from "../config/config.js";
+import { createRuntimeConfigReader } from "../config/runtime-snapshot.js";
+import { withSessionEntryReadOnlyInWorker } from "../config/sessions/session-entry-read-runtime.js";
 import { getPublishedCronJobScratchRevision } from "../cron/scratch-store.js";
 import { evaluateDecision } from "../decisions/runtime.js";
 import { DecisionContractError } from "../decisions/validation.js";
 import { isIncognitoSessionKey } from "../routing/session-key.js";
 import { onSessionIdentityMutation } from "../sessions/session-lifecycle-events.js";
+import { onInternalSessionTranscriptUpdate } from "../sessions/transcript-events.js";
 import { extractTextFromChatContent } from "../shared/chat-content.js";
 import { extractAssistantPhaseText } from "../shared/chat-message-content.js";
 import { getAgentEventLifecycleGeneration } from "./agent-events.js";
 import { resolveHeartbeatTimeoutOverrideSeconds } from "./heartbeat-config.js";
 import { isHeartbeatDeliveryAwarenessEvent } from "./heartbeat-events-filter.js";
 import { heartbeatLog } from "./heartbeat-log.js";
-import { parseHeartbeatQuestionDocument } from "./heartbeat-questions.js";
+import { isHeartbeatQuestionModeActive, parseHeartbeatQuestionDocument } from "./heartbeat-questions.js";
 import type { ReadyHeartbeatWake } from "./heartbeat-runner-execution.js";
 import { areHeartbeatsEnabled } from "./heartbeat-wake.js";
 import { resolveSystemEventQueueKey } from "./system-event-ownership.js";
@@ -54,6 +57,7 @@ export async function evaluateHeartbeatQuestions(wake: ReadyHeartbeatWake, signa
   const { preflight } = wake;
   const parsed = parseHeartbeatQuestionDocument(preflight.heartbeatScratchContent);
   const runtimeConfig = wake.runtimeConfigSnapshot;
+  const readConfig = createRuntimeConfigReader(wake.cfg);
   const lifecycle = getAgentEventLifecycleGeneration();
   const conversationKey =
     preflight.session.run.kind === "isolated"
@@ -136,19 +140,40 @@ export async function evaluateHeartbeatQuestions(wake: ReadyHeartbeatWake, signa
             cause: deadlineSignal.reason,
           }),
         );
+      // Observe the already-started read even when the deadline expired before admission.
+      read.then(resolve, reject).finally(() => {
+        deadlineSignal.removeEventListener("abort", onAbort);
+      });
       if (deadlineSignal.aborted) {
         onAbort();
         return;
       }
       deadlineSignal.addEventListener("abort", onAbort, { once: true });
-      read.then(resolve, reject).finally(() => {
-        deadlineSignal.removeEventListener("abort", onAbort);
-      });
     });
   let recentConversation: { role: string; text: string }[] = [];
   let countMessages: (() => Promise<number>) | undefined;
   let initialCount: number | undefined;
   const evaluateGroups = async () => {
+    try {
+      // Routing awaited after preflight: verify the captured identity with the watcher installed.
+      const sameIdentity = await withinDeadline(withSessionEntryReadOnlyInWorker(
+        { agentId: wake.agentId, storePath: preflight.session.storePath, sessionKey: conversationKey },
+        () => deadlineSignal.throwIfAborted(),
+        async (read) => {
+          if (!read.ok) {
+            throw read.error;
+          }
+          return read.value?.sessionId === originalEntry?.sessionId;
+        },
+      ));
+      if (!sameIdentity) {
+        conversationStale = true;
+        return run("conversation-changed");
+      }
+    } catch {
+      signal.throwIfAborted();
+      return run(deadlineSignal.aborted ? deadlineReason : "conversation-unavailable");
+    }
     if (originalEntry) {
       const target = {
         agentId: wake.agentId,
@@ -284,13 +309,20 @@ export async function evaluateHeartbeatQuestions(wake: ReadyHeartbeatWake, signa
           rubricVersion: "2",
           timeoutMs: Math.max(1, Math.min(MAX_STEP_MS, deadlineMs - Date.now())),
           signal: stepSignal,
+          // The shared runtime carries this synchronous admission to final guarded provider I/O.
+          admit: () => groupIsCurrent() &&
+            isHeartbeatQuestionModeActive(readConfig(), wake.agentId, wake.heartbeat),
         });
       } catch (error) {
-        // Only wake cancellation suppresses work; any other decision failure keeps the fallback turn.
         signal.throwIfAborted();
-        const reason =
-          error instanceof DecisionContractError ? "provider-contract-error" : "decision-error";
-        return run(`group ${group.id}: ${reason}`, evidence);
+        if (stepSignal.aborted) {
+          return run(deadlineReason, evidence);
+        }
+        if (!(error instanceof DecisionContractError)) {
+          // Provider failures return unavailable; runtime authority rejection is terminal.
+          throw error;
+        }
+        return run(`group ${group.id}: provider-contract-error`, evidence);
       }
       signal.throwIfAborted();
       if (outcome.status === "unavailable") {
@@ -322,6 +354,17 @@ export async function evaluateHeartbeatQuestions(wake: ReadyHeartbeatWake, signa
       conversationStale = true;
     }
   });
+  // A worker count can be overtaken by a committed append before its reply is consumed.
+  const stopTranscriptWatch = onInternalSessionTranscriptUpdate((update) => {
+    if (update.agentId === wake.agentId &&
+      (update.sessionKey === conversationKey || update.sessionId === originalEntry?.sessionId)) {
+      conversationStale = true;
+    }
+  });
+  const release = () => {
+    stopIdentityWatch();
+    stopTranscriptWatch();
+  };
   try {
     const result = await evaluateGroups();
     // Worker reads have no transaction to hold, so a changed transcript marks the decision stale.
@@ -329,17 +372,21 @@ export async function evaluateHeartbeatQuestions(wake: ReadyHeartbeatWake, signa
     if (countMessages) {
       const finalCount = await countMessages().catch(() => undefined);
       signal.throwIfAborted();
-      if (finalCount === undefined && result.kind === "idle" && Date.now() >= deadlineMs) {
-        // An unconfirmed all-no result never consumes the fallback turn's reserved time.
-        settled = run(deadlineReason);
-      } else if (finalCount !== initialCount) {
+      if (finalCount === undefined) {
+        // A failed read cannot prove staleness or safely suppress the ordinary turn.
+        settled = run(
+          deadlineSignal.aborted || Date.now() >= deadlineMs
+            ? deadlineReason
+            : "conversation-unavailable",
+        );
+      } else if (initialCount !== undefined && finalCount !== initialCount) {
         conversationStale = true;
       }
     }
-    // The caller releases the identity watch only after it has consumed isCurrent().
-    return { ...settled, release: stopIdentityWatch };
+    // Keep both watches until the caller has synchronously consumed isCurrent().
+    return { ...settled, release };
   } catch (error) {
-    stopIdentityWatch();
+    release();
     throw error;
   }
 }

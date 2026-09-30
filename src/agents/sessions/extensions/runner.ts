@@ -1,7 +1,3 @@
-/**
- * Extension runner - executes extensions and manages their lifecycle.
- */
-
 import type { KeyId } from "@earendil-works/pi-tui";
 import { coerceErrorMessage } from "@openclaw/normalization-core/error-coercion";
 import type { ImageContent, Model } from "../../../llm/types.js";
@@ -85,7 +81,7 @@ const RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS = [
 type BuiltInKeyBindings = Partial<Record<KeyId, { keybinding: string; restrictOverride: boolean }>>;
 
 const buildBuiltinKeybindings = (resolvedKeybindings: KeybindingsConfig): BuiltInKeyBindings => {
-  const builtinKeybindings = {} as BuiltInKeyBindings;
+  const builtinKeybindings: BuiltInKeyBindings = {};
   for (const [keybinding, keys] of Object.entries(resolvedKeybindings)) {
     if (keys === undefined) {
       continue;
@@ -116,6 +112,11 @@ interface BeforeAgentStartCombinedResult {
   messages?: NonNullable<BeforeAgentStartEventResult["message"]>[];
   systemPrompt?: string;
 }
+
+type DiscoveredResourcePaths = Record<
+  keyof ResourcesDiscoverResult,
+  Array<{ path: string; extensionPath: string }>
+>;
 
 /**
  * Events handled by the generic emit() method.
@@ -276,7 +277,6 @@ export class ExtensionRunner {
     bindExtensionMetadataActions(this.sessionManager, this.runtime, actions);
     this.runtime.getThinkingLevel = actions.getThinkingLevel;
 
-    // Context actions (required)
     this.getModel = contextActions.getModel;
     this.isIdleFn = contextActions.isIdle;
     this.getSignalFn = contextActions.getSignal;
@@ -722,12 +722,7 @@ export class ExtensionRunner {
     let result: ToolCallEventResult | undefined;
 
     for (const ext of this.extensions) {
-      const handlers = ext.handlers.get("tool_call");
-      if (!handlers || handlers.length === 0) {
-        continue;
-      }
-
-      for (const handler of handlers) {
+      for (const handler of ext.handlers.get("tool_call") ?? []) {
         ctx ??= this.createContext();
         const handlerResult = await handler(event, ctx);
 
@@ -839,31 +834,22 @@ export class ExtensionRunner {
   async emitResourcesDiscover(
     cwd: string,
     reason: ResourcesDiscoverEvent["reason"],
-  ): Promise<{
-    skillPaths: Array<{ path: string; extensionPath: string }>;
-    promptPaths: Array<{ path: string; extensionPath: string }>;
-    themePaths: Array<{ path: string; extensionPath: string }>;
-  }> {
-    const skillPaths: Array<{ path: string; extensionPath: string }> = [];
-    const promptPaths: Array<{ path: string; extensionPath: string }> = [];
-    const themePaths: Array<{ path: string; extensionPath: string }> = [];
+  ): Promise<DiscoveredResourcePaths> {
+    const paths: DiscoveredResourcePaths = { skillPaths: [], promptPaths: [], themePaths: [] };
 
     await this.dispatchHandlers("resources_discover", async (handler, ctx, extensionPath) => {
       const event: ResourcesDiscoverEvent = { type: "resources_discover", cwd, reason };
       const result = (await handler(event, ctx)) as ResourcesDiscoverResult | undefined;
 
-      if (result?.skillPaths?.length) {
-        skillPaths.push(...result.skillPaths.map((path) => ({ path, extensionPath })));
-      }
-      if (result?.promptPaths?.length) {
-        promptPaths.push(...result.promptPaths.map((path) => ({ path, extensionPath })));
-      }
-      if (result?.themePaths?.length) {
-        themePaths.push(...result.themePaths.map((path) => ({ path, extensionPath })));
+      for (const key of ["skillPaths", "promptPaths", "themePaths"] as const) {
+        const discovered = result?.[key];
+        if (discovered?.length) {
+          paths[key].push(...discovered.map((path) => ({ path, extensionPath })));
+        }
       }
     });
 
-    return { skillPaths, promptPaths, themePaths };
+    return paths;
   }
 
   /** Emit input event. Transforms chain, "handled" short-circuits. */

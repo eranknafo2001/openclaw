@@ -66,7 +66,7 @@ describe("question-mode heartbeat saved chat grant", () => {
       if (!monitor) {
         throw new Error("Missing monitor fixture");
       }
-      writeCronJobScratch({
+      await writeCronJobScratch({
         storePath: resolveCronJobsStorePath(),
         jobId: monitor.jobId,
         content: serializeHeartbeatQuestionDocument({

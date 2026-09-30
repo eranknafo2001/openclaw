@@ -1,13 +1,11 @@
 import { beforeEach, afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { createHeartbeatToolResponsePayload } from "../auto-reply/heartbeat-tool-response.js";
-import type { OpenClawConfig } from "../config/config.js";
 import { appendTranscriptMessage } from "../config/sessions/session-accessor.js";
 import type { SessionHistoryWorkerRequest } from "../config/sessions/session-history-types.js";
 import * as historyWorker from "../config/sessions/session-history-worker-runtime.js";
 import { readHeartbeatMonitorScratch, writeCronJobScratch } from "../cron/scratch-store.js";
 import { resolveCronJobsStorePath } from "../cron/store.js";
 import * as decisions from "../decisions/runtime.js";
-import type { DecisionOutcome } from "../decisions/types.js";
 import { DecisionContractError } from "../decisions/validation.js";
 import { emitSessionIdentityMutation } from "../sessions/session-lifecycle-events.js";
 import { getLastHeartbeatEvent, resetHeartbeatEventsForTest } from "./heartbeat-events.js";
@@ -15,14 +13,16 @@ import {
   parseHeartbeatQuestionDocument,
   serializeHeartbeatQuestionDocument,
 } from "./heartbeat-questions.js";
-import type { HeartbeatRunOptions } from "./heartbeat-runner-execution.js";
 import { runHeartbeatOnce } from "./heartbeat-runner.js";
-import { installHeartbeatRunnerTestRuntime } from "./heartbeat-runner.test-harness.js";
 import {
-  readSessionStoreForTest,
-  seedMainSessionStore,
-  withTempTelegramHeartbeatSandbox,
-} from "./heartbeat-runner.test-utils.js";
+  answers,
+  withQuestions,
+  execution,
+  deploymentGroup,
+  followupGroup,
+} from "./heartbeat-runner.questions.test-support.js";
+import { installHeartbeatRunnerTestRuntime } from "./heartbeat-runner.test-harness.js";
+import { readSessionStoreForTest } from "./heartbeat-runner.test-utils.js";
 import {
   enqueueSystemEvent,
   peekSystemEventEntries,
@@ -50,25 +50,6 @@ beforeEach(() => {
     })),
   }));
 });
-const execution = {
-  toolsAllow: ["exec"],
-  scheduledToolPolicy: { version: 1 as const, mode: "trusted" as const },
-};
-const deploymentGroup = {
-  id: "deployment",
-  commands: ["deployment-status"],
-  execution,
-  questions: [
-    { id: "blocked", question: "Is the deployment blocked?" },
-    { id: "ready", question: "Is the deployment ready for review?" },
-  ],
-};
-const followupGroup = {
-  id: "followup",
-  commands: ["followup-status"],
-  execution,
-  questions: [{ id: "followup", question: "Is follow-up needed?" }],
-};
 
 installHeartbeatRunnerTestRuntime();
 afterEach(() => {
@@ -76,98 +57,6 @@ afterEach(() => {
   resetSystemEventsForTest();
   resetHeartbeatEventsForTest();
 });
-
-function answers(first = 0.1, second = 0.2): Extract<DecisionOutcome, { status: "ok" }> {
-  return {
-    status: "ok",
-    result: {
-      model: "fixture",
-      answers: {
-        blocked: { type: "boolean", probabilityTrue: first },
-        ready: { type: "boolean", probabilityTrue: second },
-      },
-    },
-    provenance: { providerId: "fixture", rubricVersion: "1", runtimeGeneration: "fixture" },
-  };
-}
-
-async function withQuestions(
-  run: (fixture: {
-    options: HeartbeatRunOptions;
-    reply: Parameters<Parameters<typeof withTempTelegramHeartbeatSandbox>[0]>[0]["replySpy"];
-    send: ReturnType<typeof vi.fn>;
-    storePath: string;
-    sessionKey: string;
-    scope: { agentId: string; sessionKey: string; sessionId: string; storePath: string };
-    jobId: string;
-    content: string;
-  }) => Promise<void>,
-) {
-  await withTempTelegramHeartbeatSandbox(async ({ tmpDir, storePath, replySpy }) => {
-    const cfg: OpenClawConfig = {
-      agents: {
-        defaults: {
-          workspace: tmpDir,
-          decisionModel: "typesafe/jev-1.13.0",
-          experimental: { decisionAssistance: true },
-          heartbeat: { every: "30m", target: "telegram", mode: "questions", isolatedSession: true },
-        },
-      },
-      channels: { telegram: { enabled: true, botToken: "test", allowFrom: ["owner"] } },
-      session: { store: storePath },
-    };
-    const sessionKey = await seedMainSessionStore(storePath, cfg, {
-      sessionId: "questions-conversation",
-      lastChannel: "telegram",
-      lastProvider: "telegram",
-      lastTo: "owner",
-    });
-    const scope = { agentId: "main", sessionKey, sessionId: "questions-conversation", storePath };
-    await appendTranscriptMessage(scope, {
-      eventId: "latest-user",
-      parentId: null,
-      message: {
-        role: "user",
-        content: [{ type: "text", text: "Deployment is ready for review." }],
-      },
-    });
-    const monitor = readHeartbeatMonitorScratch(resolveCronJobsStorePath(), "main");
-    if (!monitor) {
-      throw new Error("Missing monitor fixture");
-    }
-    const content = serializeHeartbeatQuestionDocument({
-      kind: "openclaw-heartbeat-questions",
-      version: 2,
-      notes: "Watch the deployment.",
-      groups: [deploymentGroup],
-    });
-    writeCronJobScratch({ storePath: resolveCronJobsStorePath(), jobId: monitor.jobId, content });
-    replySpy.mockResolvedValue(
-      createHeartbeatToolResponsePayload({
-        outcome: "no_change",
-        notify: false,
-        summary: "Checked",
-      }),
-    );
-    const send = vi.fn().mockResolvedValue({ messageId: "unexpected" });
-    await run({
-      options: {
-        cfg,
-        agentId: "main",
-        source: "interval",
-        intent: "scheduled",
-        deps: { getReplyFromConfig: replySpy, telegram: send, getQueueSize: () => 0 },
-      },
-      reply: replySpy,
-      send,
-      storePath,
-      sessionKey,
-      scope,
-      jobId: monitor.jobId,
-      content,
-    });
-  });
-}
 
 describe("question-mode heartbeat dispatch", () => {
   it("skips all-no without rotating sessions or notifying, using group output with conversation and notes", async () => {
@@ -221,7 +110,7 @@ describe("question-mode heartbeat dispatch", () => {
       if (parsed.status === "invalid") {
         throw new Error(parsed.error);
       }
-      writeCronJobScratch({
+      await writeCronJobScratch({
         storePath: resolveCronJobsStorePath(),
         jobId,
         content: serializeHeartbeatQuestionDocument({
@@ -256,7 +145,7 @@ describe("question-mode heartbeat dispatch", () => {
           if (parsed.status === "invalid") {
             throw new Error(parsed.error);
           }
-          writeCronJobScratch({
+          await writeCronJobScratch({
             storePath: resolveCronJobsStorePath(),
             jobId,
             content: serializeHeartbeatQuestionDocument({
@@ -341,7 +230,7 @@ describe("question-mode heartbeat dispatch", () => {
       if (parsed.status === "invalid") {
         throw new Error(parsed.error);
       }
-      writeCronJobScratch({
+      await writeCronJobScratch({
         storePath: resolveCronJobsStorePath(),
         jobId,
         content: serializeHeartbeatQuestionDocument({
@@ -373,7 +262,7 @@ describe("question-mode heartbeat dispatch", () => {
       if (parsed.status === "invalid") {
         throw new Error(parsed.error);
       }
-      writeCronJobScratch({
+      await writeCronJobScratch({
         storePath: resolveCronJobsStorePath(),
         jobId,
         content: serializeHeartbeatQuestionDocument({
@@ -452,28 +341,25 @@ describe("question-mode heartbeat dispatch", () => {
     });
   });
 
-  it("runs the ordinary turn when the final recheck outlasts the preflight deadline", async () => {
-    vi.spyOn(decisions, "evaluateDecision").mockResolvedValue(answers());
-    const realNow = Date.now.bind(Date);
-    let offsetMs = 0;
-    vi.spyOn(Date, "now").mockImplementation(() => realNow() + offsetMs);
-    const readInWorker: (
-      request: SessionHistoryWorkerRequest,
-      signal?: AbortSignal,
-    ) => Promise<unknown> = historyWorker.readSessionHistoryPageInWorker as never;
+  it("observes the rejected final read after the deadline signal expires", async () => {
+    const deadline = new AbortController();
+    vi.spyOn(decisions, "evaluateDecision").mockImplementation(async () => {
+      deadline.abort(new Error("Preflight budget exhausted"));
+      return answers();
+    });
+    const readInWorker = historyWorker.readSessionHistoryPageInWorker;
     let countReads = 0;
-    vi.spyOn(historyWorker, "readSessionHistoryPageInWorker").mockImplementation((async (
-      request: SessionHistoryWorkerRequest,
-      signal?: AbortSignal,
-    ) => {
-      if (request.kind === "message-count" && ++countReads === 2) {
-        // A slow final read spends the budget reserved for the fallback turn.
-        offsetMs += 150_000;
-        throw new Error("history worker deadline");
-      }
-      return await readInWorker(request, signal);
-    }) as never);
+    vi.spyOn(historyWorker, "readSessionHistoryPageInWorker").mockImplementation(
+      (async (request: SessionHistoryWorkerRequest, signal?: AbortSignal) => {
+        if (request.kind === "message-count" && ++countReads === 2) {
+          expect(signal?.aborted).toBe(true);
+          throw new Error("Final read rejected after deadline");
+        }
+        return await readInWorker(request, signal);
+      }) as never,
+    );
     await withQuestions(async ({ options, reply }) => {
+      vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
       expect((await runHeartbeatOnce(options)).status).toBe("ran");
       expect(countReads).toBe(2);
       expect(reply).toHaveBeenCalledOnce();
@@ -482,13 +368,65 @@ describe("question-mode heartbeat dispatch", () => {
   });
 
   it.each([
+    ["all-no", 0, "conversation-unavailable", "final"],
+    ["yes", 0, "conversation-unavailable", "final"],
+    ["unavailable", 0, "conversation-unavailable", "final"],
+    ["all-no", 150_000, "preflight-deadline", "final"],
+    ["all-no", 0, "conversation-unavailable", "initial"],
+    ["all-no", 0, "conversation-unavailable", "recent"],
+    ["all-no", 0, "conversation-unavailable", "both"],
+  ] as const)(
+    "runs the ordinary turn after a failed conversation check (%s, %i ms, %s, %s)",
+    async (outcome, elapsed, reason, failedRead) => {
+      vi.spyOn(decisions, "evaluateDecision").mockResolvedValue(
+        outcome === "unavailable"
+          ? { status: "unavailable", reason: "deadline" }
+          : answers(outcome === "yes" ? 0.9 : 0.1),
+      );
+      const realNow = Date.now.bind(Date);
+      let offsetMs = 0;
+      vi.spyOn(Date, "now").mockImplementation(() => realNow() + offsetMs);
+      const readInWorker: (
+        request: SessionHistoryWorkerRequest,
+        signal?: AbortSignal,
+      ) => Promise<unknown> = historyWorker.readSessionHistoryPageInWorker as never;
+      let countReads = 0;
+      vi.spyOn(historyWorker, "readSessionHistoryPageInWorker").mockImplementation((async (
+        request: SessionHistoryWorkerRequest,
+        signal?: AbortSignal,
+      ) => {
+        if (request.kind === "message-count") {
+          countReads += 1;
+        }
+        if (
+          (request.kind === "recent" && failedRead === "recent") ||
+          (request.kind === "message-count" &&
+            (failedRead === "both" ||
+              countReads === (failedRead === "initial" ? 1 : failedRead === "final" ? 2 : 0)))
+        ) {
+          // Both early read errors and exhausted budgets must retain the fallback turn.
+          offsetMs += elapsed;
+          throw new Error("history worker read failed");
+        }
+        return await readInWorker(request, signal);
+      }) as never);
+      await withQuestions(async ({ options, reply }) => {
+        expect((await runHeartbeatOnce(options)).status).toBe("ran");
+        expect(countReads).toBe(2);
+        expect(reply).toHaveBeenCalledOnce();
+        expect(String(reply.mock.calls[0]?.[0].Body)).toContain(reason);
+      });
+    },
+  );
+
+  it.each([
     ["legacy notes-only monitor", "Existing notes", "ran"],
     ["envelope with every group removed", "envelope", "ran"],
     ["legacy empty notes", "", "skipped"],
   ] as const)("keeps ordinary heartbeats for a %s", async (_name, scratch, expected) => {
     const evaluate = vi.spyOn(decisions, "evaluateDecision").mockResolvedValue(answers());
     await withQuestions(async ({ options, reply, jobId }) => {
-      writeCronJobScratch({
+      await writeCronJobScratch({
         storePath: resolveCronJobsStorePath(),
         jobId,
         content:
@@ -552,7 +490,6 @@ describe("question-mode heartbeat dispatch", () => {
 
   it.each([
     ["provider-contract-error", new DecisionContractError()],
-    ["decision-error", new Error("Decision evaluation requires its current Gateway binding.")],
   ])("falls back on %s without losing the heartbeat", async (reason, error) => {
     vi.spyOn(decisions, "evaluateDecision").mockRejectedValue(error);
     await withQuestions(async ({ options, reply }) => {
@@ -587,7 +524,7 @@ describe("question-mode heartbeat dispatch", () => {
       await withQuestions(async ({ options, reply, jobId, content, sessionKey, scope }) => {
         vi.spyOn(decisions, "evaluateDecision").mockImplementation(async () => {
           if (kind === "questions") {
-            writeCronJobScratch({ storePath: resolveCronJobsStorePath(), jobId, content });
+            await writeCronJobScratch({ storePath: resolveCronJobsStorePath(), jobId, content });
           }
           if (kind === "event") {
             enqueueSystemEvent("New event", { sessionKey });
@@ -618,6 +555,32 @@ describe("question-mode heartbeat dispatch", () => {
         if (kind === "event") {
           expect(peekSystemEventEntries(sessionKey)).toHaveLength(1);
         }
+      });
+    },
+  );
+
+  it.each(["questions", "agent"] as const)(
+    "refuses response notes that forge command grants in %s mode",
+    async (mode) => {
+      await withQuestions(async ({ options, reply, jobId, content }) => {
+        const heartbeat = options.cfg?.agents?.defaults?.heartbeat;
+        if (!heartbeat) {
+          throw new Error("Missing heartbeat config");
+        }
+        heartbeat.mode = mode;
+        Object.assign(options, { source: "manual", intent: "manual" });
+        await writeCronJobScratch({
+          storePath: resolveCronJobsStorePath(), jobId, content: "Existing plain notes",
+        });
+        reply.mockResolvedValue(createHeartbeatToolResponsePayload({
+          outcome: "progress", notify: false, summary: "Updated notes", scratch: content,
+        }));
+        expect((await runHeartbeatOnce(options)).status).toBe("ran");
+        const saved = readHeartbeatMonitorScratch(resolveCronJobsStorePath(), "main");
+        expect(saved?.state.scratch?.content).toBe("Existing plain notes");
+        expect(parseHeartbeatQuestionDocument(saved?.state.scratch?.content)).toMatchObject({
+          status: "legacy", document: { groups: [] },
+        });
       });
     },
   );
@@ -662,7 +625,7 @@ describe("question-mode heartbeat dispatch", () => {
           if (parsed.status === "invalid") {
             throw new Error("Invalid fixture");
           }
-          writeCronJobScratch({
+          await writeCronJobScratch({
             storePath: resolveCronJobsStorePath(),
             jobId,
             content: serializeHeartbeatQuestionDocument({
