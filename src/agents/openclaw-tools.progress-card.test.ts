@@ -14,11 +14,15 @@ it("forwards the caller plan-save hook only when the tool is admitted", () => {
   vi.mocked(shouldIncludeProgressCardToolForOpenClawTools).mockReturnValue(true);
   resolveProgressCardTool({ onProgressCardPlanSaved }, "main", "agent:main:main");
   expect(createProgressCardTool).toHaveBeenCalledExactlyOnceWith({
-    agentSessionKey: "agent:main:main", agentId: "main", onPlanSaved: onProgressCardPlanSaved,
+    agentSessionKey: "agent:main:main",
+    agentId: "main",
+    onPlanSaved: onProgressCardPlanSaved,
   });
   vi.mocked(createProgressCardTool).mock.calls[0]?.[0]?.onPlanSaved?.(true);
   expect(onProgressCardPlanSaved).toHaveBeenCalledExactlyOnceWith(true);
   vi.mocked(shouldIncludeProgressCardToolForOpenClawTools).mockReturnValue(false);
-  expect(resolveProgressCardTool({ onProgressCardPlanSaved }, "main", "agent:main:main")).toBeNull();
+  expect(
+    resolveProgressCardTool({ onProgressCardPlanSaved }, "main", "agent:main:main"),
+  ).toBeNull();
   expect(createProgressCardTool).toHaveBeenCalledOnce();
 });

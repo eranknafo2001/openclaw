@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { appendTranscriptMessage, replaceSessionEntry } from "../config/sessions/session-accessor.js";
+import {
+  appendTranscriptMessage,
+  replaceSessionEntry,
+} from "../config/sessions/session-accessor.js";
 import type { SessionHistoryWorkerRequest } from "../config/sessions/session-history-types.js";
 import * as historyWorker from "../config/sessions/session-history-worker-runtime.js";
 import * as decisions from "../decisions/runtime.js";
@@ -27,20 +30,23 @@ it("retains the wake when an append overtakes the final worker count", async () 
   let countReads = 0;
   await withQuestions(async ({ options, reply, scope }) => {
     vi.spyOn(historyWorker, "readSessionHistoryPageInWorker").mockImplementation((async (
-      request: SessionHistoryWorkerRequest, signal?: AbortSignal,
+      request: SessionHistoryWorkerRequest,
+      signal?: AbortSignal,
     ) => {
       const result = await read(request, signal);
       // Return the unchanged snapshot only after the real append has committed.
       if (request.kind === "message-count" && ++countReads === 2) {
         await appendTranscriptMessage(scope, {
-          eventId: "overtaking-message", parentId: "latest-user",
+          eventId: "overtaking-message",
+          parentId: "latest-user",
           message: { role: "user", content: [{ type: "text", text: "New work arrived." }] },
         });
       }
       return result;
     }) as never);
     expect(await runHeartbeatOnce(options)).toMatchObject({
-      status: "skipped", reason: "requests-in-flight",
+      status: "skipped",
+      reason: "requests-in-flight",
     });
     expect(countReads).toBe(2);
     expect(reply).not.toHaveBeenCalled();
@@ -59,7 +65,8 @@ it("revalidates the preflight identity after delivery routing resets it", async 
       },
     );
     expect(await runHeartbeatOnce(options)).toMatchObject({
-      status: "skipped", reason: "requests-in-flight",
+      status: "skipped",
+      reason: "requests-in-flight",
     });
     expect(collector).not.toHaveBeenCalled();
     expect(decisions.evaluateDecision).not.toHaveBeenCalled();
@@ -96,3 +103,20 @@ it("does not turn a closed Decision authority into fallback work", async () => {
     expect(reply).not.toHaveBeenCalled();
   });
 });
+
+it.each(["x".repeat(9_000), "界".repeat(3_000)])(
+  "keeps the ordinary turn when the newest message exceeds the evidence budget",
+  async (text) => {
+    await withQuestions(async ({ options, reply, scope }) => {
+      await appendTranscriptMessage(scope, {
+        eventId: "oversized-newest",
+        parentId: "latest-user",
+        message: { role: "user", content: [{ type: "text", text }] },
+      });
+      expect((await runHeartbeatOnce(options)).status).toBe("ran");
+      expect(reply).toHaveBeenCalledOnce();
+      expect(collector).not.toHaveBeenCalled();
+      expect(decisions.evaluateDecision).not.toHaveBeenCalled();
+    });
+  },
+);

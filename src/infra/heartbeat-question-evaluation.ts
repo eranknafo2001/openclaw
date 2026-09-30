@@ -14,7 +14,10 @@ import { getAgentEventLifecycleGeneration } from "./agent-events.js";
 import { resolveHeartbeatTimeoutOverrideSeconds } from "./heartbeat-config.js";
 import { isHeartbeatDeliveryAwarenessEvent } from "./heartbeat-events-filter.js";
 import { heartbeatLog } from "./heartbeat-log.js";
-import { isHeartbeatQuestionModeActive, parseHeartbeatQuestionDocument } from "./heartbeat-questions.js";
+import {
+  isHeartbeatQuestionModeActive,
+  parseHeartbeatQuestionDocument,
+} from "./heartbeat-questions.js";
 import type { ReadyHeartbeatWake } from "./heartbeat-runner-execution.js";
 import { areHeartbeatsEnabled } from "./heartbeat-wake.js";
 import { resolveSystemEventQueueKey } from "./system-event-ownership.js";
@@ -41,6 +44,9 @@ function boundRecentConversation(messages: unknown[]): { role: string; text: str
     }
     bytes += Buffer.byteLength(text, "utf8");
     if (bytes > 8 * 1024) {
+      if (visible.length === 0) {
+        throw new Error("Newest conversation message exceeds the question evidence budget");
+      }
       break;
     }
     visible.unshift({ role: message.role, text });
@@ -156,16 +162,22 @@ export async function evaluateHeartbeatQuestions(wake: ReadyHeartbeatWake, signa
   const evaluateGroups = async () => {
     try {
       // Routing awaited after preflight: verify the captured identity with the watcher installed.
-      const sameIdentity = await withinDeadline(withSessionEntryReadOnlyInWorker(
-        { agentId: wake.agentId, storePath: preflight.session.storePath, sessionKey: conversationKey },
-        () => deadlineSignal.throwIfAborted(),
-        async (read) => {
-          if (!read.ok) {
-            throw read.error;
-          }
-          return read.value?.sessionId === originalEntry?.sessionId;
-        },
-      ));
+      const sameIdentity = await withinDeadline(
+        withSessionEntryReadOnlyInWorker(
+          {
+            agentId: wake.agentId,
+            storePath: preflight.session.storePath,
+            sessionKey: conversationKey,
+          },
+          () => deadlineSignal.throwIfAborted(),
+          async (read) => {
+            if (!read.ok) {
+              throw read.error;
+            }
+            return read.value?.sessionId === originalEntry?.sessionId;
+          },
+        ),
+      );
       if (!sameIdentity) {
         conversationStale = true;
         return run("conversation-changed");
@@ -310,7 +322,8 @@ export async function evaluateHeartbeatQuestions(wake: ReadyHeartbeatWake, signa
           timeoutMs: Math.max(1, Math.min(MAX_STEP_MS, deadlineMs - Date.now())),
           signal: stepSignal,
           // The shared runtime carries this synchronous admission to final guarded provider I/O.
-          admit: () => groupIsCurrent() &&
+          admit: () =>
+            groupIsCurrent() &&
             isHeartbeatQuestionModeActive(readConfig(), wake.agentId, wake.heartbeat),
         });
       } catch (error) {
@@ -356,8 +369,10 @@ export async function evaluateHeartbeatQuestions(wake: ReadyHeartbeatWake, signa
   });
   // A worker count can be overtaken by a committed append before its reply is consumed.
   const stopTranscriptWatch = onInternalSessionTranscriptUpdate((update) => {
-    if (update.agentId === wake.agentId &&
-      (update.sessionKey === conversationKey || update.sessionId === originalEntry?.sessionId)) {
+    if (
+      update.agentId === wake.agentId &&
+      (update.sessionKey === conversationKey || update.sessionId === originalEntry?.sessionId)
+    ) {
       conversationStale = true;
     }
   });

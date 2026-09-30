@@ -349,15 +349,16 @@ describe("question-mode heartbeat dispatch", () => {
     });
     const readInWorker = historyWorker.readSessionHistoryPageInWorker;
     let countReads = 0;
-    vi.spyOn(historyWorker, "readSessionHistoryPageInWorker").mockImplementation(
-      (async (request: SessionHistoryWorkerRequest, signal?: AbortSignal) => {
-        if (request.kind === "message-count" && ++countReads === 2) {
-          expect(signal?.aborted).toBe(true);
-          throw new Error("Final read rejected after deadline");
-        }
-        return await readInWorker(request, signal);
-      }) as never,
-    );
+    vi.spyOn(historyWorker, "readSessionHistoryPageInWorker").mockImplementation((async (
+      request: SessionHistoryWorkerRequest,
+      signal?: AbortSignal,
+    ) => {
+      if (request.kind === "message-count" && ++countReads === 2) {
+        expect(signal?.aborted).toBe(true);
+        throw new Error("Final read rejected after deadline");
+      }
+      return await readInWorker(request, signal);
+    }) as never);
     await withQuestions(async ({ options, reply }) => {
       vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
       expect((await runHeartbeatOnce(options)).status).toBe("ran");
@@ -488,18 +489,19 @@ describe("question-mode heartbeat dispatch", () => {
     });
   });
 
-  it.each([
-    ["provider-contract-error", new DecisionContractError()],
-  ])("falls back on %s without losing the heartbeat", async (reason, error) => {
-    vi.spyOn(decisions, "evaluateDecision").mockRejectedValue(error);
-    await withQuestions(async ({ options, reply }) => {
-      expect((await runHeartbeatOnce(options)).status).toBe("ran");
-      expect(reply).toHaveBeenCalledOnce();
-      const prompt = String(reply.mock.calls[0]?.[0].Body);
-      expect(prompt).toContain(`group deployment: ${reason}`);
-      expect(prompt).not.toContain("Gateway binding");
-    });
-  });
+  it.each([["provider-contract-error", new DecisionContractError()]])(
+    "falls back on %s without losing the heartbeat",
+    async (reason, error) => {
+      vi.spyOn(decisions, "evaluateDecision").mockRejectedValue(error);
+      await withQuestions(async ({ options, reply }) => {
+        expect((await runHeartbeatOnce(options)).status).toBe("ran");
+        expect(reply).toHaveBeenCalledOnce();
+        const prompt = String(reply.mock.calls[0]?.[0].Body);
+        expect(prompt).toContain(`group deployment: ${reason}`);
+        expect(prompt).not.toContain("Gateway binding");
+      });
+    },
+  );
 
   it("does not start fallback work when the wake is cancelled during evaluation", async () => {
     const controller = new AbortController();
@@ -570,16 +572,24 @@ describe("question-mode heartbeat dispatch", () => {
         heartbeat.mode = mode;
         Object.assign(options, { source: "manual", intent: "manual" });
         await writeCronJobScratch({
-          storePath: resolveCronJobsStorePath(), jobId, content: "Existing plain notes",
+          storePath: resolveCronJobsStorePath(),
+          jobId,
+          content: "Existing plain notes",
         });
-        reply.mockResolvedValue(createHeartbeatToolResponsePayload({
-          outcome: "progress", notify: false, summary: "Updated notes", scratch: content,
-        }));
+        reply.mockResolvedValue(
+          createHeartbeatToolResponsePayload({
+            outcome: "progress",
+            notify: false,
+            summary: "Updated notes",
+            scratch: content,
+          }),
+        );
         expect((await runHeartbeatOnce(options)).status).toBe("ran");
         const saved = readHeartbeatMonitorScratch(resolveCronJobsStorePath(), "main");
         expect(saved?.state.scratch?.content).toBe("Existing plain notes");
         expect(parseHeartbeatQuestionDocument(saved?.state.scratch?.content)).toMatchObject({
-          status: "legacy", document: { groups: [] },
+          status: "legacy",
+          document: { groups: [] },
         });
       });
     },

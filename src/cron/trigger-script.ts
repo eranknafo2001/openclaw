@@ -1,9 +1,5 @@
 import crypto from "node:crypto";
 import { createHeartbeatContextCollector } from "./heartbeat-context-collector.js";
-export type {
-  HeartbeatContextCollection,
-  HeartbeatContextCommandOutput,
-} from "./heartbeat-context-collector.js";
 import {
   createOperationalRunInstanceRef,
   prepareAgentRunAdmission,

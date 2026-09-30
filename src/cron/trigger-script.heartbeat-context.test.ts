@@ -8,7 +8,8 @@ import { jsonResult, type AnyAgentTool } from "../agents/tools/common.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../plugins/runtime.js";
 import { createChannelTestPluginBase, createTestRegistry } from "../test-utils/channel-plugins.js";
-import { createCronScriptRuntime, type HeartbeatContextCollection } from "./trigger-script.js";
+import type { HeartbeatContextCollection } from "./heartbeat-context-collector.js";
+import { createCronScriptRuntime } from "./trigger-script.js";
 
 const request = (): HeartbeatContextCollection => ({
   agentId: "main",
